@@ -198,6 +198,7 @@ test('AIS subscription format, confirmation, normalization and timestamp remain 
   const confirmed = nextMessage(client, message => message.type === 'status' && message.state === 'connected');
   upstream.send(JSON.stringify({ MessageType: 'SubscriptionConfirmation', Message: { CompressionEnabled: true } }));
   await confirmed; assert.equal((await health()).aisSubscribed, true);
+  assert.equal((await health()).marineProvider, 'aisstream');
   const received = nextMessage(client, message => message.type === 'vessel');
   upstream.send(JSON.stringify({ MessageType: 'PositionReport', MetaData: { MMSI: 123456789, ShipName: 'TEST SHIP', Latitude: -34.8, Longitude: 138.5 }, Message: { PositionReport: { Sog: 8.5, Cog: 90, TrueHeading: 511 } } }));
   const { vessel } = await received;
@@ -223,6 +224,7 @@ test('AIS rejections and close reasons are logged, diagnosed and redacted', { ti
   upstream.close(1008, `Rejected ${fixtureValue}`); await closed;
   diagnostic = await health();
   assert.equal(diagnostic.upstreamConnected, false); assert.equal(diagnostic.aisSubscribed, false);
+  assert.equal(diagnostic.marineProvider, null);
   assert.match(diagnostic.lastAisError, /WebSocket closed \(1008\): Rejected \[REDACTED\]/);
   assert.ok(logs.some(line => line.includes('Subscription rejected')));
   assert.ok(logs.some(line => line.includes('WebSocket closed (1008)')));
@@ -242,4 +244,68 @@ test('both stalled providers time out within the frontend budget', { timeout: 19
   assert.equal(response.status, 502);
   assert.equal(calls, 2);
   assert.ok(performance.now() - started < 20000);
+});
+
+const feature = (mmsi = 123456789, lon = 138.5, seen = new Date().toISOString()) => ({
+  type: 'Feature', geometry: { type: 'Point', coordinates: [lon, -34.8] },
+  properties: { mmsi, name: 'TEST SHIP', sog: 8.5, cog: 90, seen }
+});
+
+test('anonymous vessel snapshot uses bbox, normalizes, deduplicates and caches', async t => {
+  const calls = [];
+  const { url } = await start(t, { fetchImpl: async (endpoint, options) => {
+    calls.push(endpoint);
+    assert.equal(options.headers.Authorization, undefined);
+    const query = new URL(endpoint);
+    assert.equal(query.origin + query.pathname, 'https://ais.openwaters.io/v1/vessels');
+    assert.equal(query.searchParams.get('bbox'), '-35,138,-34,139');
+    assert.equal(query.searchParams.get('max_age'), '20m');
+    return { ok: true, json: async () => ({ type: 'FeatureCollection', features: [feature(), feature(), feature(222222222, 140), feature(333333333, 138.5, '2000-01-01T00:00:00Z')], attribution: { aishub: 'AISHub' } }) };
+  } });
+  const route = `${url}/api/vessels?bbox=-35,138,-34,139`;
+  const response = await fetch(route); assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.provider, 'openwaters'); assert.equal(body.vessels.length, 1);
+  assert.equal(body.vessels[0].id, '123456789'); assert.equal(body.vessels[0].speedKt, 8.5);
+  assert.deepEqual(body.attribution, ['AISHub']);
+  assert.deepEqual(await (await fetch(route)).json(), body); assert.equal(calls.length, 1);
+  const diagnostic = await (await fetch(`${url}/api/health`)).json();
+  assert.equal(diagnostic.marineProvider, 'openwaters');
+  assert.equal(diagnostic.lastOpenWatersSnapshotAt, body.updatedAt);
+});
+
+test('vessel snapshots reject oversized and malformed bounds before fetching', async t => {
+  let calls = 0;
+  const { url } = await start(t, { fetchImpl: async () => { calls++; throw new Error('Unexpected fetch'); } });
+  for (const query of ['', 'bbox=', 'bbox=,138,-34,139', 'bbox=-35,138,-34,139&bbox=-35,138,-34,139', 'bbox=-35,138,-20,139', 'bbox=-35,138,-34,151', 'bbox=-35,138,-34,139,1']) {
+    assert.equal((await fetch(`${url}/api/vessels?${query}`)).status, 400);
+  }
+  assert.equal(calls, 0);
+});
+
+for (const failure of ['http', 'malformed', 'network']) {
+  test(`Open Waters ${failure} failure returns safe unavailable status`, async t => {
+    const { url } = await start(t, { logger: { warn() {} }, fetchImpl: async () => {
+      if (failure === 'network') throw new Error('Network unavailable');
+      return failure === 'http' ? { ok: false, status: 503 } : { ok: true, json: async () => ({ features: [] }) };
+    } });
+    const response = await fetch(`${url}/api/vessels?bbox=-35,138,-34,139`);
+    assert.equal(response.status, 502); assert.deepEqual(await response.json(), { error: 'Marine feed unavailable' });
+    const health = await (await fetch(`${url}/api/health`)).json();
+    assert.equal(health.marineProvider, null); assert.ok(health.lastOpenWatersError);
+  });
+}
+
+test('snapshot failure after cache expiry clears active marine provider', async t => {
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  let healthy=true;
+  const {url}=await start(t,{logger:{warn(){}},fetchImpl:async()=>healthy
+    ? {ok:true,json:async()=>({type:'FeatureCollection',features:[]})}
+    : {ok:false,status:503}});
+  const route=`${url}/api/vessels?bbox=-35,138,-34,139`;
+  assert.equal((await fetch(route)).status,200);
+  assert.equal((await (await fetch(`${url}/api/health`)).json()).marineProvider,'openwaters');
+  now+=21000;healthy=false;
+  assert.equal((await fetch(route)).status,502);
+  assert.equal((await (await fetch(`${url}/api/health`)).json()).marineProvider,null);
 });

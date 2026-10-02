@@ -44,3 +44,22 @@ test('AIS uses the report position and preserves unknown numeric fields', () => 
   event.MetaData.Latitude = null;
   assert.equal(normalizeVessel(event), null);
 });
+
+const { normalizeOpenWatersVessel } = require('../backend/lib');
+test('normalizes Open Waters GeoJSON, sentinels and original timestamps', () => {
+  const now = Date.parse('2026-10-03T00:01:00Z');
+  const feature = { type: 'Feature', id: 123456789, geometry: { type: 'Point', coordinates: [138.5, -34.8] }, properties: { kind: 'vessel', name: ' TEST SHIP ', sog: 8.5, heading: 511, cog: 90, seen: '2026-10-03T00:00:00Z', source: 'aishub' } };
+  const vessel = normalizeOpenWatersVessel(feature, now);
+  assert.equal(vessel.id, '123456789'); assert.equal(vessel.kind, 'vessel');
+  assert.equal(vessel.lat, -34.8); assert.equal(vessel.lon, 138.5);
+  assert.equal(vessel.name, 'TEST SHIP'); assert.equal(vessel.speedKt, 8.5);
+  assert.equal(vessel.heading, 90); assert.equal(vessel.updatedAt, now - 60000);
+  assert.equal(vessel.source, 'aishub');
+  assert.equal(normalizeOpenWatersVessel({ ...feature, geometry: null }), null);
+  assert.equal(normalizeOpenWatersVessel({ ...feature, geometry: { type: 'Point', coordinates: [181, 0] } }), null);
+  assert.equal(normalizeOpenWatersVessel({ ...feature, id: 11 }), null);
+  assert.equal(normalizeOpenWatersVessel({ ...feature, properties: { kind: 'base' } }), null);
+  const unknown = normalizeOpenWatersVessel({ ...feature, properties: { mmsi: '123456789', sog: null, heading: null, cog: 360 } }, now);
+  assert.equal(unknown.heading, null); assert.equal(unknown.speedKt, null); assert.equal(unknown.updatedAt, now);
+  assert.equal(normalizeOpenWatersVessel({ ...feature, properties: { heading: 0, cog: 90 } }, now).heading, 0);
+});

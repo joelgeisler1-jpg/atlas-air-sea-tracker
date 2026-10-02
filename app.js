@@ -16,7 +16,9 @@
     renderTimer: null, demoTimer: null, fetchController: null, pollTimer: null,
     lastAisMessage: 0, lastUpdate: 0, flightRegion: null, demoStep: 0,
     aisConnected: false, aisError: false, aisOutOfRange: false,
-    flightError: false, lastFetchRegion: '', requestTimer: null
+    flightError: false, lastFetchRegion: '', requestTimer: null,
+    marineFallback: false, marinePollTimer: null, marineController: null,
+    marineRequestTimer: null, aisWatchTimer: null
   };
   const places = {
     adelaide: [-34.93, 138.60, 8], singapore: [1.29, 103.85, 9],
@@ -115,7 +117,12 @@
 
   function upsert(x) {
     if (!validPoint(x) || !x.id || !['aircraft','vessel'].includes(x.kind)) return;
-    (x.kind === 'aircraft' ? state.aircraft : state.vessels).set(x.id,x);
+    x={...x,id:String(x.id)};
+    const collection=x.kind==='aircraft'?state.aircraft:state.vessels;
+    const previous=collection.get(x.id);
+    if(previous && x.updatedAt < previous.updatedAt) return;
+    if(x.kind==='vessel' && !x.name && previous?.name) x.name=previous.name;
+    collection.set(x.id,x);
     markHistory(x);
     state.lastUpdate = Date.now();
     queueRender();
@@ -196,9 +203,7 @@
     state.aisOutOfRange=false;
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer=null;
-    const sock=state.socket; state.socket=null;
-    if (sock) sock.close(1000,'Client switched modes');
-    state.aisConnected=false;
+    stopMarine();
   }
   function stopDemo() { clearInterval(state.demoTimer); state.demoTimer=null; }
 
@@ -292,56 +297,108 @@
     return b[0]>=-90 && b[2]<=90 && b[1]>=-180 && b[3]<=180 &&
       b[0]<b[2] && b[1]<b[3] && b[2]-b[0]<=8 && b[3]-b[1]<=12;
   }
-  function openAis() {
-    if (state.demo || !state.seaOn || map.getZoom()<minZoom) return;
+  const marineAllowed = () => !state.demo && state.seaOn && map.getZoom()>=minZoom && bboxAllowed(currentBbox());
+  function stopFallback() {
+    state.marineFallback=false;
+    clearInterval(state.marinePollTimer);state.marinePollTimer=null;
+    if(state.marineController) state.marineController.abort();
+    state.marineController=null;
+    clearTimeout(state.marineRequestTimer);state.marineRequestTimer=null;
+  }
+  function stopMarine() {
+    stopFallback();
+    clearTimeout(state.aisWatchTimer);state.aisWatchTimer=null;
+    clearTimeout(state.reconnectTimer);state.reconnectTimer=null;
+    const socket=state.socket;state.socket=null;
+    if(socket) socket.close();
+    state.aisConnected=false;state.lastAisMessage=0;
+  }
+  function watchAis(delay) {
+    clearTimeout(state.aisWatchTimer);
+    state.aisWatchTimer=setTimeout(()=>{state.aisWatchTimer=null;startFallback();},delay);
+  }
+  async function refreshVessels(force=false) {
+    if(!state.marineFallback || !marineAllowed()) return;
+    if(state.marineController && !force) return;
+    if(state.marineController) state.marineController.abort();
+    const controller=new AbortController();state.marineController=controller;
+    clearTimeout(state.marineRequestTimer);
+    state.marineRequestTimer=setTimeout(()=>controller.abort(),12000);
     const bbox=currentBbox();
-    state.aisOutOfRange=!bboxAllowed(bbox);
-    if (state.aisOutOfRange) {
-      state.aisConnected=false;
-      setFeedStatus('vessels','Zoom in for AIS','warn');
-      if (state.socket) {const s=state.socket;state.socket=null;s.close();}
-      queueRender();return;
+    try {
+      const response=await fetch(`${base}/api/vessels?bbox=${encodeURIComponent(bbox.join(','))}`, {signal:controller.signal,cache:'no-store'});
+      const body=await response.json();
+      if(!response.ok || !Array.isArray(body?.vessels)) throw new Error('Marine feed unavailable');
+      if(controller!==state.marineController || !state.marineFallback || !marineAllowed() || bbox.join(',')!==currentBbox().join(',')) return;
+      for(const vessel of body.vessels) if(vessel?.kind==='vessel') upsert(vessel);
+      if(get('marine-attribution')) get('marine-attribution').textContent=(Array.isArray(body.attribution)?body.attribution:[]).filter(value=>typeof value==='string').join(' · ');
+      state.lastUpdate=Date.now();
+      setFeedStatus('vessels','Open Waters live','active');queueRender();
+    } catch {
+      if(controller===state.marineController && state.marineFallback && marineAllowed()) setFeedStatus('vessels','Marine feed unavailable','warn');
+    } finally {
+      if(controller===state.marineController) {
+        clearTimeout(state.marineRequestTimer);state.marineController=null;
+      }
     }
-    if (state.socket?.readyState===WebSocket.OPEN) {
-      state.socket.send(JSON.stringify({action:'subscribe',bbox}));
-      return;
-    }
-    if (state.socket?.readyState===WebSocket.CONNECTING) return;
-    clearTimeout(state.reconnectTimer);
-    const wsURL=base.replace(/^https:/,'wss:').replace(/^http:/,'ws:')+'/stream/ais';
-    const socket=new WebSocket(wsURL);
-    state.socket=socket;
+  }
+  function startFallback() {
+    if(!marineAllowed() || state.marineFallback) return;
+    state.marineFallback=true;
     setFeedStatus('vessels','Connecting to AIS…','warn');
+    refreshVessels();
+    state.marinePollTimer=setInterval(()=>refreshVessels(),25000);
+  }
+  function openAis() {
+    if(state.demo || !state.seaOn) return;
+    state.aisOutOfRange=!bboxAllowed(currentBbox());
+    if(!marineAllowed()) {
+      stopMarine();setFeedStatus('vessels','Zoom in for marine traffic','warn');queueRender();return;
+    }
+    const bbox=currentBbox();
+    if(state.socket?.readyState===WebSocket.OPEN) {
+      state.socket.send(JSON.stringify({action:'subscribe',bbox}));return;
+    }
+    if(state.socket?.readyState===WebSocket.CONNECTING) return;
+    clearTimeout(state.reconnectTimer);
+    if(!state.marineFallback) {
+      setFeedStatus('vessels','Connecting to AIS…','warn');
+      if(!state.aisWatchTimer) watchAis(20000);
+    }
+    const wsURL=base.replace(/^https:/,'wss:').replace(/^http:/,'ws:')+'/stream/ais';
+    let socket;
+    try { socket=new WebSocket(wsURL); } catch { startFallback();return; }
+    state.socket=socket;
     socket.onopen=()=> {
-      if (socket!==state.socket) return;
-      const b=currentBbox();
-      socket.send(JSON.stringify({action:'subscribe',bbox:b}));
+      if(socket===state.socket && marineAllowed()) socket.send(JSON.stringify({action:'subscribe',bbox:currentBbox()}));
     };
     socket.onmessage=event=>{
-      if (socket!==state.socket) return;
+      if(socket!==state.socket || !marineAllowed()) return;
       let data;try {data=JSON.parse(event.data);}catch{return;}
-      if (data.type==='vessel' && data.vessel) {
-        state.aisConnected=true;
-        state.lastAisMessage=Date.now();
-        if(data.vessel.kind==='vessel') upsert(data.vessel);
-        setFeedStatus('vessels','Receiving AIS messages','active');
-      } else if (data.type==='status') {
+      if(data?.type==='vessel' && data.vessel?.kind==='vessel' && validPoint(data.vessel) && /^\d{9}$/.test(String(data.vessel.id))) {
+        state.aisConnected=true;state.lastAisMessage=Date.now();
+        stopFallback();watchAis(60000);
+        upsert(data.vessel);
+        setFeedStatus('vessels','AISstream live','active');
+      } else if(data?.type==='status') {
         state.aisConnected=data.state==='connected';
-        if(data.state==='connected') setFeedStatus('vessels','Listening for vessels','active');
-        else if(data.state==='unconfigured') setFeedStatus('vessels','AIS key not configured','warn');
-        else setFeedStatus('vessels','Connecting to AIS…','warn');
-      } else if(data.type==='error') {setFeedStatus('vessels','AIS stream error','warn');toast(data.message);}
+        if(data.state==='connected') {
+          // A reconnect must produce vessel data before replacing a working snapshot feed.
+          if(!state.marineFallback) {setFeedStatus('vessels','AISstream live','active');watchAis(60000);}
+        } else if(data.state==='unconfigured' || data.state==='reconnecting') startFallback();
+        else if(!state.marineFallback) setFeedStatus('vessels','Connecting to AIS…','warn');
+      } else if(data?.type==='error') startFallback();
       queueRender();
     };
     socket.onclose=()=> {
       if(socket!==state.socket || state.demo) return;
       state.socket=null;state.aisConnected=false;
-      if (!state.seaOn || map.getZoom()<minZoom) return;
-      setFeedStatus('vessels','Reconnecting AIS…','warn');
+      if(!marineAllowed()) return;
+      startFallback();
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer=setTimeout(openAis,6000);
     };
-    socket.onerror=()=> {if(socket===state.socket) setFeedStatus('vessels','AIS connection problem','warn');};
+    socket.onerror=()=> {if(socket===state.socket) startFallback();};
   }
 
   function updateViewport() {
@@ -350,15 +407,14 @@
     if (map.getZoom()<minZoom) {
       if(state.fetchController) state.fetchController.abort();
       state.fetchController=null;clearTimeout(state.requestTimer);
-      clearTimeout(state.reconnectTimer);state.aisConnected=false;state.aisOutOfRange=false;
-      if(state.socket) {const s=state.socket;state.socket=null;s.close();}
+      stopMarine();state.aisOutOfRange=false;
       state.aircraft.clear();state.vessels.clear();
       setFeedStatus('aircraft',state.airOn?'Zoom in for traffic':'Layer hidden','warn');
       setFeedStatus('vessels',state.seaOn?'Zoom in for traffic':'Layer hidden','warn');
       queueRender();return;
     }
     if(state.airOn) refreshAircraft(true);
-    if(state.seaOn) openAis();
+    if(state.seaOn) {openAis();if(state.marineFallback) refreshVessels(true);}
     const bounds=map.getBounds();
     for(const [id,x] of state.vessels) if(!bounds.contains([x.lat,x.lon])) state.vessels.delete(id);
     queueRender();
@@ -377,8 +433,7 @@
       if (!state.airOn) {state.aircraft.clear();if(state.fetchController)state.fetchController.abort();setFeedStatus('aircraft','Layer hidden');}
       else refreshAircraft(true);
       if (!state.seaOn) {
-        if(state.socket){const s=state.socket;state.socket=null;s.close();}
-        clearTimeout(state.reconnectTimer);state.aisConnected=false;state.aisOutOfRange=false;
+        stopMarine();state.aisOutOfRange=false;
         state.vessels.clear();setFeedStatus('vessels','Layer hidden');
       } else openAis();
     }
@@ -391,7 +446,7 @@
   get('search').addEventListener('input',queueRender);
   get('refresh-button').addEventListener('click',()=>{
     if(state.demo) { seedDemo();toast('Refreshed simulated targets'); }
-    else {refreshAircraft(true);openAis();toast('Refreshing aircraft; AIS is a continuous stream.');}
+    else {refreshAircraft(true);openAis();if(state.marineFallback)refreshVessels(true);toast('Refreshing traffic feeds.');}
   });
   get('demo-button').addEventListener('click',()=>{
     if (!base) {toast('Demo mode: set API_BASE in config.js and deploy the backend to enable live data.');return;}

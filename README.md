@@ -8,7 +8,7 @@ A **mobile-friendly map** for exploring aircraft observed by ADS-B and ship posi
 
 1. A GitHub account, to publish the front end using [GitHub Pages](https://docs.github.com/en/pages/quickstart).
 2. A [Render](https://render.com/) account, to host the optional live-data backend. Render's free instance can spin down when idle and may take about a minute to wake up.
-3. A **free AISstream API key** from <https://www.aisstream.io/> to receive real-time vessel messages. AISstream **does not permit direct browser connections**: its key must be server-side.
+3. An optional **AISstream API key** from <https://www.aisstream.io/> for the preferred real-time vessel stream. Its key stays server-side. If AISstream fails, is unconfigured, or goes quiet, the backend uses anonymous [Open Waters aiscast snapshots](https://openwaters.io/api/ais/), which need no additional credential.
 4. The ADS-B backend uses the adsb.lol point endpoint as its primary source and automatically falls back to <https://opendata.adsb.fi/> if the primary request fails. Each attempt has a 6.5-second timeout, including response parsing, leaving headroom within the frontend’s 20-second timeout. Successful responses identify the source in the `provider` field. Both providers receive an explicit Atlas User-Agent. See <https://api.adsb.lol/docs>. The provider may rate-limit or change access, and asks users to contact them before production use. Their data is licensed under **ODbL**.
 
 There is no service credential in the downloaded project. Demo mode is conspicuously labelled **SIMULATED** until the backend URL is configured.
@@ -31,7 +31,7 @@ There is no service credential in the downloaded project. Demo mode is conspicuo
    - `ALLOWED_ORIGIN` = `https://YOUR_USERNAME.github.io` (only the origin; **do not append `/atlas-air-sea`**).
    - `MAX_AIS_VIEWERS` = `3` (default). The provider limits connections; this sample service deliberately permits only three concurrent browser clients using one shared provider connection.
 4. Deploy; note the public backend address, for example `https://atlas-air-sea-backend.onrender.com`.
-5. Confirm `https://YOUR-BACKEND.onrender.com/api/health` returns JSON, including `"ok":true` and `"aisConfigured":true`. The health response does not reveal your key. Diagnostics include `upstreamConnected` (WebSocket open), `aisSubscribed` (a successful `SubscriptionConfirmation` received), `lastAisMessageAt` (Unix milliseconds of the latest valid vessel report, or `null`), and `lastAisError` (latest upstream error or close code/reason, or `null`). Error details are redacted before they reach logs or health responses. Message/error history remains available through reconnects; connection flags reset when the socket closes. If `ALLOWED_ORIGIN` is set, open this URL directly or use a terminal; a browser fetch from a different origin is rejected.
+5. Confirm `https://YOUR-BACKEND.onrender.com/api/health` returns JSON, including `"ok":true` and `"aisConfigured":true`. The health response does not reveal your key. `marineProvider` reports the backend’s most recently active marine source (`aisstream`, `openwaters`, or `null` when neither is recently available); it describes shared backend activity, not each browser’s selection. `lastOpenWatersSnapshotAt` records the latest successful snapshot fetch and `lastOpenWatersError` records a redacted snapshot failure. Diagnostics also include `upstreamConnected` (WebSocket open), `aisSubscribed` (a successful `SubscriptionConfirmation` received), `lastAisMessageAt` (Unix milliseconds of the latest valid vessel report, or `null`), and `lastAisError` (latest upstream error or close code/reason, or `null`). Error details are redacted before they reach logs or health responses. Message/error history remains available through reconnects; connection flags reset when the socket closes. If `ALLOWED_ORIGIN` is set, open this URL directly or use a terminal; a browser fetch from a different origin is rejected.
 
 ### C. Join the front end to the backend
 
@@ -45,7 +45,7 @@ There is no service credential in the downloaded project. Demo mode is conspicuo
    });
    ```
 
-2. Commit the change. Reload your GitHub Pages app. The status should say **LIVE FEEDS**. Wait for the AIS stream to receive new vessel messages; it does not return a historical snapshot upon connection.
+2. Commit the change. Reload your GitHub Pages app. The status should say **LIVE FEEDS**. AISstream adds vessels as reports arrive. If it is unavailable, Open Waters supplies recent viewport snapshots automatically. The Marine status identifies the source.
 
 **iPhone:** Use Safari to open the Pages link and choose **Share → Add to Home Screen**. The site then behaves like a convenient home-screen web app (it still needs a network connection). The downloaded ZIP is also editable with your preferred code editor.
 
@@ -60,7 +60,7 @@ There is no service credential in the downloaded project. Demo mode is conspicuo
 ## User interface
 
 - **Aircraft:** on/off. Aircraft use a 250 NM *radius* query; the dashed ring shows the approximate query area. Their positions are polled every 20 seconds, subject to provider limits.
-- **Marine:** on/off. Vessels are streamed as position reports *arrive* in the current viewport, with a maximum allowed area of **8° latitude × 12° longitude**. Zoom in if needed.
+- **Marine:** on/off. AISstream is preferred; Open Waters snapshots are the automatic fallback. Both use the current viewport, limited to **8° latitude × 12° longitude** (96 square degrees, within the anonymous area cap of 100). Zoom in if needed. Fallback begins after 20 seconds without a subscription, on a stream error/reconnect/close, or after 60 seconds without vessel reports. Snapshots poll every 25 seconds, with 8-second backend and 12-second browser request timeouts. Polling stops when Marine is disabled, the area or zoom is invalid, demo mode starts, or AIS vessel reports resume. Mere reconnection confirmation keeps a working fallback active until vessel data returns.
 - **Search:** narrows displayed targets by callsign, identifier, registration, aircraft type or ship name.
 - **Tap a marker:** displays the identifier, ground speed, heading, altitude (for aircraft) and latest received position fields where available.
 - **Trails:** are collected **only while this browser session remains open**; neither provider's historical tracks are queried.
@@ -71,7 +71,7 @@ There is no service credential in the downloaded project. Demo mode is conspicuo
 
 - This is a personal exploration dashboard, **not** an aviation or marine safety system. Data coverage, completeness and freshness depend on ground receivers, relays, and provider availability. Aircraft or ships can be absent or delayed.
 - A single AISstream account currently has a limit of three subscribed connections and three connections per originating IP. The backend shares **one upstream connection** among at most three viewers by combining their geographic bounding boxes. For more viewers, design an aggregated service and validate provider terms and throughput.
-- Opening the AIS layer does **not** retrieve all vessels already in the region. It adds and updates vessels on new AIS reports. Vessel positions are removed after 20 minutes without updates.
+- AISstream adds vessels on new reports rather than returning an initial snapshot. Open Waters fallback fetches positions reported within the last 20 minutes using `max_age=20m`. Original report timestamps are retained, and stale positions are removed after 20 minutes. Both sources update the same MMSI-indexed vessels and in-session trails; older snapshots cannot overwrite newer stream positions. Coverage still depends on the underlying receivers.
 - The backend does not persist tracking history or ingest truly global data. Building persistent global coverage would require separate feed agreements, rate limiting, data retention, spatial indexing and scalable infrastructure.
 - `adsb.lol` API data is under the **Open Database License (ODbL 1.0)**. Respect attribution, share-alike where applicable, and the provider's usage policies. AISstream data and service access are governed by its own terms.
 - OpenStreetMap standard tiles need no API key. They require internet access and visible attribution, and are intended for modest interactive use under the [OSMF tile usage policy](https://operations.osmfoundation.org/policies/tiles/). Browser caching and referrer defaults must be preserved; bulk downloads and offline prefetching are not supported. Opening a local file may not send the required referrer, so use a local HTTP server for development. For substantial public traffic, use a suitable hosted or self-hosted tile service.
@@ -86,7 +86,7 @@ styles.css             Responsive dark theme
 config.js              Public backend URL (NOT secret credentials)
 app.js                 Map, filtering, trails, polling and WebSocket client
 render.yaml            Optional Render deployment blueprint
-backend/server.js      Aircraft REST proxy + shared AIS WebSocket relay
+backend/server.js      Aircraft proxy, AIS relay, anonymous vessel snapshot proxy
 backend/lib.js         Provider message normalization and geographic checks
 backend/package.json   Node dependencies and test command
 backend/.env.example   Template for server-side environment settings
@@ -99,6 +99,11 @@ tests/*.test.js        Normalization, HTTP/WebSocket and frontend regression tes
 
 - [adsb.lol API](https://api.adsb.lol/docs)
 - [AISstream API](https://www.aisstream.io/documentation)
+- [Open Waters AIS API](https://openwaters.io/api/ais/)
 - [GitHub Pages](https://docs.github.com/en/pages/quickstart)
 - [Render WebSockets](https://render.com/docs/websocket)
 - [Render Free Web Service](https://render.com/docs/free)
+
+## Marine snapshot endpoint
+
+`GET /api/vessels?bbox=minLat,minLon,maxLat,maxLon` accepts the same bounds as the stream subscription and returns `{provider, updatedAt, bbox, vessels, attribution}`. Invalid or oversized areas return HTTP 400; upstream failures return HTTP 502 with `Marine feed unavailable`. Exact viewport snapshots are cached for 20 seconds, and identical concurrent requests are shared. `vessels` uses the existing target shape and original report timestamps; `attribution` carries the upstream source credit lines shown in the sidebar. No authorization header, token or API key is sent to Open Waters. TLS certificate validation remains enabled.

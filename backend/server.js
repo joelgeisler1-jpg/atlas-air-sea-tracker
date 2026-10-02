@@ -3,7 +3,7 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const {
-  clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel
+  clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel, normalizeOpenWatersVessel
 } = require('./lib');
 
 function createServer({ env = process.env, fetchImpl = globalThis.fetch, upstreamURL = 'wss://stream.aisstream.io/v0/stream', logger = console } = {}) {
@@ -16,6 +16,11 @@ const viewerLimit = Number(env.MAX_AIS_VIEWERS || 3);
 if (!Number.isSafeInteger(viewerLimit) || viewerLimit < 1) throw new Error('MAX_AIS_VIEWERS must be a positive integer');
 const MAX_AIS_VIEWERS = viewerLimit;
 const aircraftCache = new Map();
+const vesselCache = new Map();
+const vesselRequests = new Map();
+let lastOpenWatersSnapshotAt = null;
+let lastOpenWatersError = null;
+let aisConfirmedAt = null;
 
 function isOriginAllowed(origin) {
   // Set ALLOWED_ORIGIN in Render for public deployments to restrict browser access.
@@ -34,6 +39,7 @@ app.use((req, res, next) => {
 app.get('/api/health', (req, res) => res.json({
   ok: true, aisConfigured: Boolean(AIS_KEY), upstreamConnected: upstream?.readyState === WebSocket.OPEN,
   aisSubscribed, lastAisMessageAt, lastAisError,
+  marineProvider: activeMarineProvider(), lastOpenWatersSnapshotAt, lastOpenWatersError,
   maxAisViewers: MAX_AIS_VIEWERS, aircraftProvider: 'adsb.lol', aircraftFallbackProvider: 'adsb.fi'
 }));
 
@@ -77,6 +83,68 @@ app.get('/api/aircraft', async (req, res) => {
   }
   if (cached && Date.now() - cached.at < 60000) return res.json({ ...cached.body, stale: true });
   return res.status(502).json({ error: 'ADS-B providers unavailable. Check rate limits or retry.' });
+});
+
+function activeMarineProvider() {
+  const now = Date.now();
+  const recentSnapshot = lastOpenWatersError === null && lastOpenWatersSnapshotAt !== null && now - lastOpenWatersSnapshotAt < 60000;
+  if (upstream?.readyState === WebSocket.OPEN && aisSubscribed) {
+    if (lastAisMessageAt !== null && now - lastAisMessageAt < 60000 &&
+        (!recentSnapshot || lastAisMessageAt >= lastOpenWatersSnapshotAt)) return 'aisstream';
+    if (!recentSnapshot && aisConfirmedAt !== null && now - aisConfirmedAt < 60000) return 'aisstream';
+  }
+  return recentSnapshot ? 'openwaters' : null;
+}
+
+app.get('/api/vessels', async (req, res) => {
+  const parts = typeof req.query.bbox === 'string' ? req.query.bbox.split(',') : [];
+  const bbox = parts.length === 4 && parts.every(value => value.trim() !== '')
+    ? validateBoundingBox(parts.map(Number)) : null;
+  if (!bbox) return res.status(400).json({ error: 'Invalid bbox: use south,west,north,east within 8° latitude × 12° longitude.' });
+  const key = bbox.join(',');
+  const cached = vesselCache.get(key);
+  if (cached && Date.now() - cached.at < 20000) return res.json(cached.body);
+  try {
+    // Share identical in-flight requests and briefly cache snapshots across viewers.
+    let pending = vesselRequests.get(key);
+    if (!pending) {
+      pending = (async () => {
+        const url = new URL('https://ais.openwaters.io/v1/vessels');
+        url.searchParams.set('bbox', key);
+        url.searchParams.set('max_age', '20m');
+        const response = await fetchImpl(url.toString(), {
+          signal: AbortSignal.timeout(8000),
+          headers: { Accept: 'application/geo+json, application/json',
+            'User-Agent': 'Atlas-Air-Sea-Tracker/1.0 (+https://github.com/joelgeisler1-jpg/atlas-air-sea-tracker)' }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const raw = await response.json();
+        if (raw?.type !== 'FeatureCollection' || !Array.isArray(raw.features)) throw new Error('Invalid Open Waters GeoJSON');
+        const now = Date.now();
+        const unique = new Map();
+        for (const feature of raw.features) {
+          const vessel = normalizeOpenWatersVessel(feature, now);
+          if (!vessel || !inBounds(vessel.lat, vessel.lon, bbox) || now - vessel.updatedAt > 20 * 60000) continue;
+          if (!unique.has(vessel.id) || vessel.updatedAt >= unique.get(vessel.id).updatedAt) unique.set(vessel.id, vessel);
+        }
+        const attribution = raw.attribution && typeof raw.attribution === 'object' && !Array.isArray(raw.attribution)
+          ? Object.values(raw.attribution).filter(value => typeof value === 'string').map(value => value.slice(0, 500)) : [];
+        const body = { provider: 'openwaters', updatedAt: now, bbox, vessels: [...unique.values()], attribution };
+        lastOpenWatersSnapshotAt = now;
+        lastOpenWatersError = null;
+        vesselCache.set(key, { at: now, body });
+        while (vesselCache.size > 120) vesselCache.delete(vesselCache.keys().next().value);
+        return body;
+      })();
+      vesselRequests.set(key, pending);
+      pending.finally(() => vesselRequests.delete(key)).catch(() => {});
+    }
+    return res.json(await pending);
+  } catch (error) {
+    lastOpenWatersError = safeDiagnostic(error.message);
+    logger.warn('Open Waters:', lastOpenWatersError);
+    return res.status(502).json({ error: 'Marine feed unavailable' });
+  }
 });
 
 const wsServer = new WebSocket.Server({ noServer: true, maxPayload: 2048 });
@@ -161,6 +229,7 @@ function connectUpstream() {
     }
     if (evt.MessageType === 'SubscriptionConfirmation') {
       aisSubscribed = true;
+      aisConfirmedAt = Date.now();
       notify({ type: 'status', state: 'connected' }); return;
     }
     const vessel = normalizeVessel(evt);

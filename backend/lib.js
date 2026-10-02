@@ -70,4 +70,25 @@ function normalizeVessel(event, now = Date.now()) {
   };
 }
 
-module.exports = { clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel };
+function normalizeOpenWatersVessel(feature, now = Date.now()) {
+  if (feature?.type !== 'Feature' || feature.geometry?.type !== 'Point') return null;
+  const coordinates = feature.geometry.coordinates;
+  if (!Array.isArray(coordinates) || coordinates.length < 2) return null;
+  const [lon, lat] = coordinates;
+  const props = feature.properties || {};
+  if (props.kind && props.kind !== 'vessel') return null;
+  const id = String(props.mmsi ?? feature.id ?? '').trim();
+  if (!/^\d{9}$/.test(id) || !validLatLon(lat, lon)) return null;
+  const reportedAt = typeof props.seen === 'string' ? Date.parse(props.seen) : NaN;
+  return {
+    kind: 'vessel', id, lat, lon,
+    name: String(props.name || '').trim().slice(0, 70),
+    speedKt: finite(props.sog) && props.sog >= 0 && props.sog < 102.3 ? props.sog : null,
+    heading: finite(props.heading) && props.heading >= 0 && props.heading < 360 ? props.heading
+      : (finite(props.cog) && props.cog >= 0 && props.cog < 360 ? props.cog : null),
+    updatedAt: Number.isFinite(reportedAt) ? Math.min(reportedAt, now) : now,
+    source: String(props.source || '').slice(0, 100)
+  };
+}
+
+module.exports = { clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel, normalizeOpenWatersVessel };
