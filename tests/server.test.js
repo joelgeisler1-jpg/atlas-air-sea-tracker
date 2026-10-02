@@ -75,3 +75,171 @@ test('rejects invalid configured viewer limits', () => {
     assert.throws(() => createServer({ env: { MAX_AIS_VIEWERS: value } }), /positive integer/);
   }
 });
+
+const USER_AGENT = 'Atlas-Air-Sea-Tracker/1.0 (+https://github.com/joelgeisler1-jpg/atlas-air-sea-tracker)';
+const AIRCRAFT = { hex: '7c1234', lat: -34, lon: 138, flight: 'QFA123 ', gs: 431.9, seen_pos: 4 };
+
+test('primary point endpoint uses User-Agent and preserves normalization and cache', async t => {
+  const calls = [];
+  const { url } = await start(t, { fetchImpl: async (endpoint, options) => {
+    calls.push({ endpoint, options });
+    return { ok: true, json: async () => ({ ac: [AIRCRAFT, { ...AIRCRAFT, seen_pos: 100 }] }) };
+  } });
+  const route = `${url}/api/aircraft?lat=-34&lon=138&radius=250`;
+  const body = await (await fetch(route)).json();
+  assert.equal(body.provider, 'adsb.lol'); assert.equal(body.aircraft.length, 1);
+  assert.equal(body.aircraft[0].callsign, 'QFA123'); assert.equal(body.aircraft[0].speedKt, 432);
+  assert.equal(calls[0].endpoint, 'https://api.adsb.lol/v2/point/-34.0000/138.0000/250');
+  assert.equal(calls[0].options.headers['User-Agent'], USER_AGENT);
+  assert.ok(calls[0].options.signal instanceof AbortSignal);
+  assert.deepEqual(await (await fetch(route)).json(), body);
+  assert.equal(calls.length, 1);
+});
+
+for (const failure of ['http', 'timeout', 'network', 'invalid-json', 'invalid-body']) {
+  test(`adsb.fi succeeds after primary ${failure} failure`, async t => {
+    const calls = [];
+    const { url } = await start(t, { logger: { warn() {} }, fetchImpl: async (endpoint, options) => {
+      calls.push(endpoint);
+      assert.equal(options.headers['User-Agent'], USER_AGENT);
+      if (calls.length === 1) {
+        if (failure === 'http') return { ok: false, status: 503 };
+        if (failure === 'timeout') throw new DOMException('Timed out', 'TimeoutError');
+        if (failure === 'network') throw new Error('Network unavailable');
+        if (failure === 'invalid-json') return { ok: true, json: async () => { throw new SyntaxError('Bad JSON'); } };
+        return { ok: true, json: async () => ({ ac: null }) };
+      }
+      return { ok: true, json: async () => ({ ac: [AIRCRAFT] }) };
+    } });
+    const route = `${url}/api/aircraft?lat=-34&lon=138`;
+    const response = await fetch(route); assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.provider, 'adsb.fi'); assert.equal(body.aircraft[0].id, '7C1234');
+    assert.deepEqual(calls, [
+      'https://api.adsb.lol/v2/point/-34.0000/138.0000/250',
+      'https://opendata.adsb.fi/api/v3/lat/-34.0000/lon/138.0000/dist/250'
+    ]);
+    await fetch(route); assert.equal(calls.length, 2, 'fallback responses are cached too');
+  });
+}
+
+test('failure of both providers returns safe 502', async t => {
+  const calls = [];
+  const { url } = await start(t, { logger: { warn() {} }, fetchImpl: async endpoint => {
+    calls.push(endpoint); return { ok: false, status: calls.length === 1 ? 429 : 503 };
+  } });
+  const response = await fetch(`${url}/api/aircraft?lat=-34&lon=138`);
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), { error: 'ADS-B providers unavailable. Check rate limits or retry.' });
+  assert.equal(calls.length, 2);
+});
+
+test('both-provider failure preserves stale cache window and expiry', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  let healthy = true; let calls = 0;
+  const { url } = await start(t, { logger: { warn() {} }, fetchImpl: async () => {
+    calls++;
+    return healthy ? { ok: true, json: async () => ({ ac: [AIRCRAFT] }) } : { ok: false, status: 503 };
+  } });
+  const route = `${url}/api/aircraft?lat=-34&lon=138`;
+  const original = await (await fetch(route)).json();
+  healthy = false; now += 21000;
+  assert.deepEqual(await (await fetch(route)).json(), { ...original, stale: true });
+  assert.equal(calls, 3); now += 40000;
+  assert.equal((await fetch(route)).status, 502);
+});
+
+async function aisFixture(t) {
+  const provider = new WebSocket.Server({ port: 0, host: '127.0.0.1', perMessageDeflate: true });
+  await once(provider, 'listening');
+  t.after(async () => {
+    for (const socket of provider.clients) socket.terminate();
+    await new Promise(resolve => provider.close(resolve));
+  });
+  // Disposable local fixture value, never a real API key or a remote credential.
+  const fixtureValue = require('node:crypto').randomUUID();
+  const logs = [];
+  const { url } = await start(t, {
+    env: { ALLOWED_ORIGIN: 'https://example.test', AISSTREAM_API_KEY: fixtureValue },
+    upstreamURL: `ws://127.0.0.1:${provider.address().port}`,
+    logger: { warn: (...args) => logs.push(args.join(' ')) }
+  });
+  const connection = once(provider, 'connection');
+  const client = new WebSocket(url.replace('http:', 'ws:') + '/stream/ais', { origin: 'https://example.test' });
+  const messages = [];
+  client.on('message', data => messages.push(JSON.parse(data.toString())));
+  await once(client, 'open'); t.after(() => client.terminate());
+  client.send(JSON.stringify({ action: 'subscribe', bbox: [-35,138,-34,139] }));
+  const [upstream] = await connection;
+  const [subscription] = await once(upstream, 'message');
+  const health = async () => (await fetch(`${url}/api/health`)).json();
+  return { upstream, subscription: JSON.parse(subscription), fixtureValue, messages, client, logs, health };
+}
+
+function nextMessage(client, predicate) {
+  return new Promise(resolve => {
+    const receive = data => {
+      const message = JSON.parse(data.toString());
+      if (predicate(message)) { client.off('message', receive); resolve(message); }
+    };
+    client.on('message', receive);
+  });
+}
+
+test('AIS subscription format, confirmation, normalization and timestamp remain compatible', { timeout: 5000 }, async t => {
+  const { upstream, subscription, fixtureValue, client, health } = await aisFixture(t);
+  assert.deepEqual(subscription, {
+    APIKey: fixtureValue, BoundingBoxes: [[[-34,138],[-35,139]]],
+    FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'LongRangeAisBroadcastMessage']
+  });
+  let diagnostic = await health();
+  assert.equal(diagnostic.upstreamConnected, true); assert.equal(diagnostic.aisSubscribed, false);
+  assert.equal(diagnostic.lastAisMessageAt, null); assert.equal(diagnostic.lastAisError, null);
+  const confirmed = nextMessage(client, message => message.type === 'status' && message.state === 'connected');
+  upstream.send(JSON.stringify({ MessageType: 'SubscriptionConfirmation', Message: { CompressionEnabled: true } }));
+  await confirmed; assert.equal((await health()).aisSubscribed, true);
+  const received = nextMessage(client, message => message.type === 'vessel');
+  upstream.send(JSON.stringify({ MessageType: 'PositionReport', MetaData: { MMSI: 123456789, ShipName: 'TEST SHIP', Latitude: -34.8, Longitude: 138.5 }, Message: { PositionReport: { Sog: 8.5, Cog: 90, TrueHeading: 511 } } }));
+  const { vessel } = await received;
+  assert.equal(vessel.id, '123456789'); assert.equal(vessel.name, 'TEST SHIP');
+  assert.equal(vessel.speedKt, 8.5); assert.equal(vessel.heading, 90);
+  diagnostic = await health();
+  assert.equal(diagnostic.lastAisMessageAt, vessel.updatedAt);
+  assert.equal(JSON.stringify(diagnostic).includes(fixtureValue), false);
+  const ordered = nextMessage(client, message => message.type === 'status' && message.state === 'connected');
+  upstream.send(JSON.stringify({ MessageType: 'PositionReport', MetaData: { MMSI: 11, Latitude: -34.8, Longitude: 138.5 } }));
+  upstream.send(JSON.stringify({ MessageType: 'SubscriptionConfirmation' }));
+  await ordered; assert.equal((await health()).lastAisMessageAt, vessel.updatedAt);
+});
+
+test('AIS rejections and close reasons are logged, diagnosed and redacted', { timeout: 5000 }, async t => {
+  const { upstream, fixtureValue, client, logs, messages, health } = await aisFixture(t);
+  const rejection = nextMessage(client, message => message.type === 'error');
+  upstream.send(JSON.stringify({ error: `Invalid subscription APIKey=${fixtureValue}` }));
+  await rejection;
+  let diagnostic = await health();
+  assert.match(diagnostic.lastAisError, /Subscription rejected/); assert.match(diagnostic.lastAisError, /REDACTED/);
+  const closed = nextMessage(client, message => message.type === 'status' && message.state === 'reconnecting');
+  upstream.close(1008, `Rejected ${fixtureValue}`); await closed;
+  diagnostic = await health();
+  assert.equal(diagnostic.upstreamConnected, false); assert.equal(diagnostic.aisSubscribed, false);
+  assert.match(diagnostic.lastAisError, /WebSocket closed \(1008\): Rejected \[REDACTED\]/);
+  assert.ok(logs.some(line => line.includes('Subscription rejected')));
+  assert.ok(logs.some(line => line.includes('WebSocket closed (1008)')));
+  assert.equal(JSON.stringify({ diagnostic, logs, messages }).includes(fixtureValue), false);
+});
+
+test('both stalled providers time out within the frontend budget', { timeout: 19000 }, async t => {
+  let calls = 0;
+  const started = performance.now();
+  const { url } = await start(t, { logger: { warn() {} }, fetchImpl: async (_endpoint, { signal }) => {
+    calls++;
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  } });
+  const response = await fetch(`${url}/api/aircraft?lat=-34&lon=138`);
+  assert.equal(response.status, 502);
+  assert.equal(calls, 2);
+  assert.ok(performance.now() - started < 20000);
+});

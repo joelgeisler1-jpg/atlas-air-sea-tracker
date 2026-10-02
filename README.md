@@ -9,7 +9,7 @@ A **mobile-friendly map** for exploring aircraft observed by ADS-B and ship posi
 1. A GitHub account, to publish the front end using [GitHub Pages](https://docs.github.com/en/pages/quickstart).
 2. A [Render](https://render.com/) account, to host the optional live-data backend. Render's free instance can spin down when idle and may take about a minute to wake up.
 3. A **free AISstream API key** from <https://www.aisstream.io/> to receive real-time vessel messages. AISstream **does not permit direct browser connections**: its key must be server-side.
-4. The ADS-B backend requests data from <https://api.adsb.lol/docs>. The provider may rate-limit or change access, and asks users to contact them before production use. Their data is licensed under **ODbL**.
+4. The ADS-B backend uses the adsb.lol point endpoint as its primary source and automatically falls back to <https://opendata.adsb.fi/> if the primary request fails. Each attempt has a 6.5-second timeout, including response parsing, leaving headroom within the frontend’s 20-second timeout. Successful responses identify the source in the `provider` field. Both providers receive an explicit Atlas User-Agent. See <https://api.adsb.lol/docs>. The provider may rate-limit or change access, and asks users to contact them before production use. Their data is licensed under **ODbL**.
 
 There is no service credential in the downloaded project. Demo mode is conspicuously labelled **SIMULATED** until the backend URL is configured.
 
@@ -31,7 +31,7 @@ There is no service credential in the downloaded project. Demo mode is conspicuo
    - `ALLOWED_ORIGIN` = `https://YOUR_USERNAME.github.io` (only the origin; **do not append `/atlas-air-sea`**).
    - `MAX_AIS_VIEWERS` = `3` (default). The provider limits connections; this sample service deliberately permits only three concurrent browser clients using one shared provider connection.
 4. Deploy; note the public backend address, for example `https://atlas-air-sea-backend.onrender.com`.
-5. Confirm `https://YOUR-BACKEND.onrender.com/api/health` returns JSON, including `"ok":true` and `"aisConfigured":true`. The health response does not reveal your key. If `ALLOWED_ORIGIN` is set, open this URL directly or use a terminal; a browser fetch from a different origin is rejected.
+5. Confirm `https://YOUR-BACKEND.onrender.com/api/health` returns JSON, including `"ok":true` and `"aisConfigured":true`. The health response does not reveal your key. Diagnostics include `upstreamConnected` (WebSocket open), `aisSubscribed` (a successful `SubscriptionConfirmation` received), `lastAisMessageAt` (Unix milliseconds of the latest valid vessel report, or `null`), and `lastAisError` (latest upstream error or close code/reason, or `null`). Error details are redacted before they reach logs or health responses. Message/error history remains available through reconnects; connection flags reset when the socket closes. If `ALLOWED_ORIGIN` is set, open this URL directly or use a terminal; a browser fetch from a different origin is rejected.
 
 ### C. Join the front end to the backend
 

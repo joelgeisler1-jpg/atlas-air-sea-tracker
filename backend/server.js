@@ -6,7 +6,7 @@ const {
   clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel
 } = require('./lib');
 
-function createServer({ env = process.env, fetchImpl = globalThis.fetch, upstreamURL = 'wss://stream.aisstream.io/v0/stream' } = {}) {
+function createServer({ env = process.env, fetchImpl = globalThis.fetch, upstreamURL = 'wss://stream.aisstream.io/v0/stream', logger = console } = {}) {
 const app = express();
 const server = http.createServer(app);
 const AIS_KEY = env.AISSTREAM_API_KEY || '';
@@ -33,7 +33,8 @@ app.use((req, res, next) => {
 
 app.get('/api/health', (req, res) => res.json({
   ok: true, aisConfigured: Boolean(AIS_KEY), upstreamConnected: upstream?.readyState === WebSocket.OPEN,
-  maxAisViewers: MAX_AIS_VIEWERS, aircraftProvider: 'adsb.lol'
+  aisSubscribed, lastAisMessageAt, lastAisError,
+  maxAisViewers: MAX_AIS_VIEWERS, aircraftProvider: 'adsb.lol', aircraftFallbackProvider: 'adsb.fi'
 }));
 
 app.get('/api/aircraft', async (req, res) => {
@@ -47,23 +48,35 @@ app.get('/api/aircraft', async (req, res) => {
   const key = `${lat.toFixed(1)}:${lon.toFixed(1)}:${Math.round(radius)}`;
   const cached = aircraftCache.get(key);
   if (cached && Date.now() - cached.at < 20000) return res.json(cached.body);
-  const url = `https://api.adsb.lol/v2/lat/${lat.toFixed(4)}/lon/${lon.toFixed(4)}/dist/${Math.round(radius)}`;
-  try {
-    const response = await fetchImpl(url, { signal: AbortSignal.timeout(12000), headers: { Accept: 'application/json' } });
-    if (!response.ok) throw new Error(`ADS-B provider returned HTTP ${response.status}`);
-    const raw = await response.json();
-    if (!Array.isArray(raw.ac)) throw new Error('Invalid ADS-B response');
-    const now = Date.now();
-    const aircraft = raw.ac.map(a => normalizeAircraft(a, now)).filter(Boolean);
-    const body = { updatedAt: now, provider: 'adsb.lol', centre: { lat, lon, radiusNm: radius }, aircraft };
-    aircraftCache.set(key, { at: now, body });
-    while (aircraftCache.size > 120) aircraftCache.delete(aircraftCache.keys().next().value);
-    return res.json(body);
-  } catch (error) {
-    if (cached && Date.now() - cached.at < 60000) return res.json({ ...cached.body, stale: true });
-    console.error('Aircraft provider:', error.message);
-    return res.status(502).json({ error: 'ADS-B provider unavailable. Check rate limits or retry.' });
+  const providers = [
+    { name: 'adsb.lol', url: `https://api.adsb.lol/v2/point/${lat.toFixed(4)}/${lon.toFixed(4)}/${Math.round(radius)}` },
+    { name: 'adsb.fi', url: `https://opendata.adsb.fi/api/v3/lat/${lat.toFixed(4)}/lon/${lon.toFixed(4)}/dist/${Math.round(radius)}` }
+  ];
+  // Two 6.5-second attempts leave headroom within the frontend's 20-second timeout.
+  for (const provider of providers) {
+    try {
+      const response = await fetchImpl(provider.url, {
+        signal: AbortSignal.timeout(6500),
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'Atlas-Air-Sea-Tracker/1.0 (+https://github.com/joelgeisler1-jpg/atlas-air-sea-tracker)'
+        }
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const raw = await response.json();
+      if (!Array.isArray(raw?.ac)) throw new Error('Invalid ADS-B response');
+      const now = Date.now();
+      const aircraft = raw.ac.map(a => normalizeAircraft(a, now)).filter(Boolean);
+      const body = { updatedAt: now, provider: provider.name, centre: { lat, lon, radiusNm: radius }, aircraft };
+      aircraftCache.set(key, { at: now, body });
+      while (aircraftCache.size > 120) aircraftCache.delete(aircraftCache.keys().next().value);
+      return res.json(body);
+    } catch (error) {
+      logger.warn(`Aircraft provider ${provider.name}:`, safeDiagnostic(error.message));
+    }
   }
+  if (cached && Date.now() - cached.at < 60000) return res.json({ ...cached.body, stale: true });
+  return res.status(502).json({ error: 'ADS-B providers unavailable. Check rate limits or retry.' });
 });
 
 const wsServer = new WebSocket.Server({ noServer: true, maxPayload: 2048 });
@@ -73,6 +86,20 @@ let reconnectTimer = null;
 let updateTimer = null;
 let reconnectDelay = 2000;
 let lastSubscribeAt = 0;
+let aisSubscribed = false;
+let lastAisMessageAt = null; // Unix milliseconds; only valid normalized vessel reports count.
+let lastAisError = null;
+
+function safeDiagnostic(value) {
+  const text = String(value ?? 'Unknown error');
+  // Upstream errors/close reasons may echo credentials. Redact before logging or serving health.
+  return (AIS_KEY ? text.split(AIS_KEY).join('[REDACTED]') : text)
+    .replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500);
+}
+function recordAisError(message) {
+  lastAisError = safeDiagnostic(message);
+  logger.warn('AIS upstream:', lastAisError);
+}
 
 function send(ws, msg) {
   if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 500000) ws.send(JSON.stringify(msg));
@@ -86,7 +113,7 @@ function currentBoxes() {
 function stopUpstream() {
   clearTimeout(reconnectTimer); clearTimeout(updateTimer);
   reconnectTimer = null; updateTimer = null;
-  const old = upstream; upstream = null;
+  const old = upstream; upstream = null; aisSubscribed = false;
   if (old) { old.removeAllListeners(); old.on('error', () => {}); old.terminate(); }
 }
 function writeSubscription() {
@@ -115,6 +142,7 @@ function connectUpstream() {
   clearTimeout(reconnectTimer);
   const socket = new WebSocket(upstreamURL, { perMessageDeflate: true, handshakeTimeout: 12000 });
   upstream = socket;
+  aisSubscribed = false;
   socket.on('open', () => {
     if (socket !== upstream) return;
     reconnectDelay = 2000;
@@ -125,23 +153,31 @@ function connectUpstream() {
     let evt;
     try { evt = JSON.parse(data.toString()); } catch { return; }
     if (!evt || typeof evt !== 'object') return;
-    if (evt.error || evt.Error) {
+    if (evt.error || evt.Error || evt.MessageType === 'Error') {
+      const detail = evt.error || evt.Error || evt.Message || 'Unknown rejection';
+      recordAisError(`Subscription rejected: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
       notify({ type: 'error', message: 'AIS provider rejected the subscription. Check server configuration.' });
       return;
     }
     if (evt.MessageType === 'SubscriptionConfirmation') {
+      aisSubscribed = true;
       notify({ type: 'status', state: 'connected' }); return;
     }
     const vessel = normalizeVessel(evt);
     if (!vessel) return;
+    lastAisMessageAt = vessel.updatedAt;
     for (const [client, bbox] of aisClients) {
       if (inBounds(vessel.lat, vessel.lon, bbox)) send(client, { type: 'vessel', vessel });
     }
   });
-  socket.on('error', () => console.warn('AIS upstream connection failed'));
-  socket.on('close', () => {
+  socket.on('error', error => {
     if (socket !== upstream) return;
-    upstream = null;
+    recordAisError(`WebSocket error: ${error.message}`);
+  });
+  socket.on('close', (code, reason) => {
+    if (socket !== upstream) return;
+    recordAisError(`WebSocket closed (${code}): ${reason.toString() || 'No reason provided'}`);
+    upstream = null;aisSubscribed = false;
     notify({ type: 'status', state: 'reconnecting' });
     if (aisClients.size) {
       reconnectTimer = setTimeout(connectUpstream, reconnectDelay);
@@ -182,7 +218,7 @@ wsServer.on('connection', client => {
     if (!upstream) connectUpstream();
     else if (upstream.readyState === WebSocket.OPEN) {
       scheduleSubscription();
-      send(client, { type: 'status', state: 'connected' });
+      send(client, { type: 'status', state: aisSubscribed ? 'connected' : 'connecting' });
     }
   });
   client.on('close', () => {
