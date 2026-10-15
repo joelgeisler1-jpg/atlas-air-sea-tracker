@@ -190,7 +190,7 @@ test('AIS subscription format, confirmation, normalization and timestamp remain 
   const { upstream, subscription, fixtureValue, client, health } = await aisFixture(t);
   assert.deepEqual(subscription, {
     APIKey: fixtureValue, BoundingBoxes: [[[-34,138],[-35,139]]],
-    FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'LongRangeAisBroadcastMessage']
+    FilterMessageTypes: ['PositionReport', 'StandardClassBPositionReport', 'ExtendedClassBPositionReport', 'LongRangeAisBroadcastMessage', 'ShipStaticData', 'StaticDataReport']
   });
   let diagnostic = await health();
   assert.equal(diagnostic.upstreamConnected, true); assert.equal(diagnostic.aisSubscribed, false);
@@ -308,4 +308,71 @@ test('snapshot failure after cache expiry clears active marine provider', async 
   now+=21000;healthy=false;
   assert.equal((await fetch(route)).status,502);
   assert.equal((await (await fetch(`${url}/api/health`)).json()).marineProvider,null);
+});
+
+const photoFixture={photos:[{thumbnail:{src:'https://t.plnspttrs.net/123/example.jpg'},link:'https://www.planespotters.net/photo/123/example',photographer:'Test Photographer'}]};
+test('selected aircraft photo uses hex first, returns minimal safe fields and caches for 24 hours',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);const calls=[];
+  const {url}=await start(t,{fetchImpl:async(endpoint,options)=>{calls.push(endpoint);assert.match(options.headers['User-Agent'],/^Atlas-/);return {ok:true,json:async()=>photoFixture};}});
+  const route=`${url}/api/aircraft-photo?hex=7c1234&registration=VH-TEST`;
+  const first=await (await fetch(route)).json();
+  assert.equal(calls[0],'https://api.planespotters.net/pub/photos/hex/7c1234');
+  assert.deepEqual(Object.keys(first.photo).sort(),['photographer','sourceName','sourcePage','thumbnailUrl']);
+  assert.equal(first.photo.photographer,'Test Photographer');
+  now+=23*3600000;assert.deepEqual(await (await fetch(route)).json(),first);assert.equal(calls.length,1);
+  now+=2*3600000;await fetch(route);assert.equal(calls.length,2);
+});
+
+test('photo registration fallback and negative results are cached safely',async t=>{
+  const calls=[];const {url}=await start(t,{fetchImpl:async endpoint=>{calls.push(endpoint);return {ok:true,json:async()=>({photos:[]})};}});
+  const route=`${url}/api/aircraft-photo?hex=7c1234&registration=VH-TEST`;
+  assert.deepEqual(await (await fetch(route)).json(),{photo:null});await fetch(route);
+  assert.deepEqual(calls,['https://api.planespotters.net/pub/photos/hex/7c1234','https://api.planespotters.net/pub/photos/reg/VH-TEST']);
+});
+
+test('photo endpoint validates identifiers and never returns untrusted URLs or provider errors',async t=>{
+  const {url}=await start(t,{fetchImpl:async()=>({ok:true,json:async()=>({photos:[{thumbnail:{src:'https://evil.example/photo'},link:'javascript:alert(1)',photographer:'X'}]})})});
+  assert.equal((await fetch(`${url}/api/aircraft-photo?hex=../../env`)).status,400);
+  assert.deepEqual(await (await fetch(`${url}/api/aircraft-photo?hex=7c1234`)).json(),{photo:null});
+  assert.equal((await fetch(`${url}/api/aircraft-photo?hex=7c1234`,{headers:{Origin:'https://denied.example'}})).status,403);
+});
+
+test('photo failures reveal no provider internals',async t=>{
+  const {url}=await start(t,{fetchImpl:async()=>{throw new Error('Internal provider detail');}});
+  const response=await fetch(`${url}/api/aircraft-photo?hex=7c1234`);
+  assert.equal(response.status,502);assert.deepEqual(await response.json(),{error:'Aircraft photo unavailable'});
+});
+
+test('selected vessel detail enrichment is cached, static-only and rate limited',async t=>{
+  let calls=0;const {url}=await start(t,{fetchImpl:async endpoint=>{calls++;assert.match(endpoint,/\/v1\/vessels\/\d{9}$/);return {ok:true,json:async()=>({type:'Feature',properties:{callsign:'VHOZ',name:'TEST SHIP',type:70,flag:'AU'}})};}});
+  const route=`${url}/api/vessels/503123456/details`;
+  const body=await (await fetch(route)).json();assert.equal(body.vessel.callsign,'VHOZ');assert.equal(body.vessel.typeName,'Cargo');assert.equal(body.vessel.lat,undefined);
+  await fetch(route);assert.equal(calls,1);
+  for(let i=0;i<11;i++)assert.equal((await fetch(`${url}/api/vessels/${503123457+i}/details`)).status,200);
+  assert.equal((await fetch(`${url}/api/vessels/503123499/details`)).status,429);
+  assert.equal((await fetch(`${url}/api/vessels/invalid/details`)).status,400);
+});
+
+test('AIS static metadata is merged into later streamed position reports', {timeout:5000},async t=>{
+  const {upstream,client}=await aisFixture(t);
+  upstream.send(JSON.stringify({MessageType:'ShipStaticData',MetaData:{MMSI:503123456},Message:{ShipStaticData:{Valid:true,CallSign:'VHOZ',Name:'EXAMPLE',Type:70}}}));
+  upstream.send(JSON.stringify({MessageType:'StaticDataReport',MetaData:{MMSI:503123456},Message:{StaticDataReport:{Valid:true,PartNumber:false,ReportA:{Valid:true,Name:'UPDATED NAME'},ReportB:{Valid:false}}}}));
+  const received=nextMessage(client,x=>x.type==='vessel');
+  upstream.send(JSON.stringify({MessageType:'PositionReport',MetaData:{MMSI:503123456,Latitude:-34.8,Longitude:138.5},Message:{PositionReport:{Sog:8,Cog:90,TrueHeading:100}}}));
+  const {vessel}=await received;
+  assert.equal(vessel.callsign,'VHOZ');assert.equal(vessel.name,'UPDATED NAME');assert.equal(vessel.typeName,'Cargo');assert.equal(vessel.flagEmoji,'🇦🇺');assert.equal(vessel.trackDeg,90);assert.equal(vessel.headingDeg,100);
+});
+
+test('photo lookup falls back to registration when hex has no image',async t=>{
+  const calls=[];const {url}=await start(t,{fetchImpl:async endpoint=>{calls.push(endpoint);return {ok:true,json:async()=>endpoint.includes('/hex/')?{photos:[]}:photoFixture};}});
+  const response=await (await fetch(`${url}/api/aircraft-photo?hex=7c1234&registration=VH-TEST`)).json();
+  assert.equal(response.photo.photographer,'Test Photographer');assert.equal(calls.length,2);assert.match(calls[1],/\/reg\/VH-TEST$/);
+});
+
+test('negative vessel details and photo lookups expire sooner than successful results',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);let calls=0;
+  const {url}=await start(t,{fetchImpl:async endpoint=>{calls++;return {ok:true,json:async()=>endpoint.includes('planespotters')?{photos:[]}:{type:'Feature',properties:{mmsi:503123456,name:'KNOWN NAME'}}};}});
+  for(const route of ['/api/aircraft-photo?hex=7c1234','/api/vessels/503123456/details']) {await fetch(url+route);await fetch(url+route);}
+  assert.equal(calls,2);now+=2*3600000;
+  await fetch(url+'/api/aircraft-photo?hex=7c1234');await fetch(url+'/api/vessels/503123456/details');assert.equal(calls,4);
 });

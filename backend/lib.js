@@ -1,4 +1,5 @@
 'use strict';
+const { vesselMetadata } = require('./vessel-metadata');
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 const finite = value => typeof value === 'number' && Number.isFinite(value);
@@ -37,6 +38,8 @@ function normalizeAircraft(raw, now = Date.now()) {
     type: String(raw.t || '').trim().slice(0, 20),
     altitudeFt: raw.alt_baro === 'ground' ? 0 : (finite(raw.alt_baro) ? Math.round(raw.alt_baro) : null),
     speedKt: finite(raw.gs) ? Math.round(raw.gs) : null,
+    onGround: raw.alt_baro === 'ground',
+    trackDeg: finite(raw.track) ? ((raw.track % 360) + 360) % 360 : null,
     heading: finite(raw.track) ? ((raw.track % 360) + 360) % 360 : null,
     seenSeconds: finite(raw.seen_pos) ? raw.seen_pos : null,
     updatedAt: now,
@@ -62,7 +65,10 @@ function normalizeVessel(event, now = Date.now()) {
   const heading = payload.TrueHeading;
   return {
     kind: 'vessel', id, lat, lon,
-    name: String(meta.ShipName || '').trim().slice(0, 70),
+    ...vesselMetadata(id,{name:meta.ShipName||payload.Name,callsign:payload.CallSign,typeCode:payload.Type}),
+    provider:'aisstream',source:'aisstream',
+    trackDeg: finite(course)&&course>=0&&course<360?course:null,
+    headingDeg: finite(heading)&&heading>=0&&heading<360?heading:null,
     speedKt: Number.isFinite(speed) && speed < 102.3 && speed >= 0 ? speed : null,
     heading: Number.isFinite(heading) && heading >= 0 && heading < 360 ? heading
       : (Number.isFinite(course) && course >= 0 && course < 360 ? course : null),
@@ -82,7 +88,10 @@ function normalizeOpenWatersVessel(feature, now = Date.now()) {
   const reportedAt = typeof props.seen === 'string' ? Date.parse(props.seen) : NaN;
   return {
     kind: 'vessel', id, lat, lon,
-    name: String(props.name || '').trim().slice(0, 70),
+    ...vesselMetadata(id,props),
+    provider:'openwaters',
+    trackDeg:finite(props.cog)&&props.cog>=0&&props.cog<360?props.cog:null,
+    headingDeg:finite(props.heading)&&props.heading>=0&&props.heading<360?props.heading:null,
     speedKt: finite(props.sog) && props.sog >= 0 && props.sog < 102.3 ? props.sog : null,
     heading: finite(props.heading) && props.heading >= 0 && props.heading < 360 ? props.heading
       : (finite(props.cog) && props.cog >= 0 && props.cog < 360 ? props.cog : null),

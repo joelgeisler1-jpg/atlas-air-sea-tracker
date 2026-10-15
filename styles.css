@@ -6,3 +6,13 @@
 
 /* Apply the dark theme only to base tiles, preserving marker colours. */
 .atlas-map-tile{filter:invert(1) hue-rotate(180deg) brightness(.7) saturate(.6)}
+
+/* Upright telemetry labels: only the target SVG rotates. */
+.target-tag{position:absolute;left:35px;top:-9px;min-width:150px;max-width:210px;padding:5px 7px;background:rgba(8,18,29,.87);border:1px solid currentColor;border-radius:3px;color:var(--air);font:10px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums;pointer-events:none;box-shadow:0 2px 8px #0005;white-space:nowrap;text-align:left}
+.target-tag:before{content:"";position:absolute;left:-10px;top:20px;width:9px;border-top:1px solid currentColor;opacity:.6}
+.vessel .target-tag{color:var(--sea)}.tag-line-0{font-weight:800;font-size:11px;overflow:hidden;text-overflow:ellipsis}.tag-line-1,.tag-line-2{opacity:.9}.selected .target-tag{background:#142a3a;border-width:2px;box-shadow:0 0 9px #ffffff45}.marker-wrap{overflow:visible!important}.target-photo{margin:12px 0}.target-photo img{display:block;width:100%;max-height:180px;object-fit:cover;border-radius:6px}.target-photo figcaption{font-size:10px;color:var(--subtle);padding:5px 0}.target-photo[hidden]{display:none}.vessel-silhouette{height:75px;display:grid;place-items:center;color:var(--sea);background:#102b38;border:1px solid var(--border);border-radius:6px;margin:12px 0}.vessel-silhouette svg{width:85%;height:58px;fill:currentColor;stroke:currentColor;stroke-width:1;opacity:.7}.target-title strong,.target-grid dd{overflow-wrap:anywhere}.switch input:focus-visible+.switch-track{outline:2px solid var(--sea);outline-offset:3px}
+@media(max-width:750px){.target-tag{font-size:9px;min-width:136px;max-width:185px}.tag-line-0{font-size:10px}}
+
+@media(min-width:751px){.leaflet-top.leaflet-left{top:82px}}
+
+.target-tag{width:var(--tag-width,190px);min-width:0;max-width:210px}.target-tag.tag-left{left:auto;right:35px}.target-tag.tag-left:before{left:auto;right:-10px}

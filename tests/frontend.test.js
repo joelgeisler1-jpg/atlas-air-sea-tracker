@@ -23,7 +23,7 @@ function load(config = {}) {
   const markers = [];
   const trails = [];
   const L = { map: () => map, tileLayer: layer, control: { zoom: layer }, layerGroup: layer, circle: layer, polyline: points => {trails.push(points);return layer();}, divIcon: x => x, marker: (_point, options) => {
-    const marker = { ...layer(), options, handlers: {}, on(event, fn) { this.handlers[event] = fn; }, bindTooltip() {}, setIcon() {}, setTooltipContent() {} }; markers.push(marker); return marker;
+    const marker = { ...layer(), options, handlers: {}, on(event, fn) { this.handlers[event] = fn; }, bindTooltip() {}, setIcon(icon) {this.options.icon=icon;}, setTooltipContent() {} }; markers.push(marker); return marker;
   } };
   class Socket {
     static OPEN = 1; static CONNECTING = 0;
@@ -36,6 +36,7 @@ function load(config = {}) {
     setInterval(fn, delay) { fn.delay=delay;intervals.push(fn);return intervals.length; }, clearInterval(id) { if(id) intervals[id-1]=null; },
     fetch(url, options) { return new Promise((resolve, reject) => requests.push({ url, resolve, reject, options })); }
   };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../target-model.js'), 'utf8'), context);
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../app.js'), 'utf8'), context);
   return { get, sockets, requests, markers, trails, intervals, map, bounds,
     runTimeout(delay) {for(const [id,fn] of [...timers]) if(fn.delay===delay){timers.delete(id);fn();}},
@@ -183,4 +184,53 @@ test('viewport changes refresh fallback immediately with the new bounds', async 
   const next=marineRequests(app)[1];assert.equal(new URL(next.url).searchParams.get('bbox'),'-35,138.1,-34,139');
   await snapshot(previous,[vessel('987654321')]);await snapshot(next);app.runTimeout(220);
   assert.equal(app.get('vessel-count').textContent,'1');
+});
+
+test('persistent tags obey zoom/toggle and keep the selected tag visible',()=>{
+  const app=load();assert.ok(app.markers.every(m=>!m.options.icon.html.includes('target-tag')));
+  app.map.zoom=9;app.get('search').handlers.input();app.runTimeout(220);
+  assert.ok(app.markers.some(m=>m.options.icon.html.includes('target-tag')));
+  app.get('toggle-tags').handlers.change({target:{checked:false}});app.runTimeout(220);
+  assert.ok(app.markers.every(m=>!m.options.icon.html.includes('target-tag')));
+  app.map.zoom=8;app.markers[0].handlers.click();app.runTimeout(220);
+  assert.ok(app.markers[0].options.icon.html.includes('target-tag'));
+  assert.match(app.get('target-card').innerHTML,/CALLSIGN/);assert.match(app.get('target-card').innerHTML,/TRACK/);
+});
+
+test('photo fetch is selected-only, failure leaves aircraft details intact',async()=>{
+  const app=load({API_BASE:'http://localhost:3000'});
+  app.requests[0].resolve({ok:true,json:async()=>({aircraft:[{kind:'aircraft',id:'7C1234',lat:-34.8,lon:138.5,callsign:'QFA741',registration:'VH-X',type:'B738',altitudeFt:34000,trackDeg:82,speedKt:452,updatedAt:Date.now()}]})});
+  await settle();app.runTimeout(220);
+  assert.equal(app.requests.filter(r=>r.url.includes('aircraft-photo')).length,0);
+  app.markers[0].handlers.click();
+  const photo=app.requests.find(r=>r.url.includes('aircraft-photo'));assert.ok(photo);
+  photo.reject(new Error('Network failed'));await settle();app.runTimeout(220);
+  assert.match(app.get('target-card').innerHTML,/QFA741/);assert.match(app.get('target-card').innerHTML,/082°/);assert.doesNotMatch(app.get('target-card').innerHTML,/<img/);
+  app.runTimeout(220);assert.equal(app.requests.filter(r=>r.url.includes('aircraft-photo')).length,1);
+});
+
+test('photo success has attribution, lazy loading and clean image failure handling',async()=>{
+  const app=load({API_BASE:'http://localhost:3000'});
+  app.requests[0].resolve({ok:true,json:async()=>({aircraft:[{kind:'aircraft',id:'7C1234',lat:-34.8,lon:138.5,updatedAt:Date.now()}]})});await settle();app.runTimeout(220);app.markers[0].handlers.click();
+  app.requests.find(r=>r.url.includes('aircraft-photo')).resolve({ok:true,json:async()=>({photo:{thumbnailUrl:'https://cdn.planespotters.net/test.jpg',sourcePage:'https://www.planespotters.net/photo/test',photographer:'Test Author'}})});await settle();app.runTimeout(220);
+  assert.match(app.get('target-card').innerHTML,/© Test Author/);assert.match(app.get('target-card').innerHTML,/loading="lazy"/);
+  app.get('target-photo').onerror();assert.equal(app.get('aircraft-photo-wrap').hidden,true);
+});
+
+test('aircraft static fields survive less-complete snapshots',async()=>{
+  const app=load({API_BASE:'http://localhost:3000'});const now=Date.now();
+  app.requests[0].resolve({ok:true,json:async()=>({aircraft:[{kind:'aircraft',id:'7C1234',lat:-34.8,lon:138.5,callsign:'QFA1',type:'B738',registration:'VH-X',updatedAt:now}]})});await settle();
+  app.get('refresh-button').handlers.click();const request=app.requests.filter(r=>r.url.includes('/api/aircraft?')).at(-1);
+  request.resolve({ok:true,json:async()=>({aircraft:[{kind:'aircraft',id:'7C1234',lat:-34.79,lon:138.5,callsign:'',type:'',registration:'',updatedAt:now+1000}]})});await settle();app.runTimeout(220);app.markers[0].handlers.click();
+  assert.match(app.get('target-card').innerHTML,/QFA1/);assert.match(app.get('target-card').innerHTML,/B738/);assert.match(app.get('target-card').innerHTML,/VH-X/);
+});
+
+test('dense tags avoid collisions and place phone-edge labels to the left',()=>{
+  const app=load();app.map.zoom=9;app.map.getSize=()=>({x:390,y:844});app.map.latLngToContainerPoint=()=>({x:330,y:400});
+  app.get('search').handlers.input();app.runTimeout(220);
+  const tagged=app.markers.filter(m=>m.options.icon.html.includes('target-tag'));
+  assert.equal(tagged.length,1);assert.match(tagged[0].options.icon.html,/tag-left/);
+  app.markers[16].handlers.click();app.runTimeout(220);
+  const selected=app.markers.filter(m=>m.options.icon.html.includes('target-tag'));
+  assert.equal(selected.length,1);assert.match(selected[0].options.icon.html,/selected/);
 });

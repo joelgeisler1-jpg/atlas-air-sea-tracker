@@ -31,6 +31,7 @@
 
         <div class="eyebrow section-spacing">SEARCH & FILTERS <span class="eyebrow-line"></span></div>
         <label class="search-box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="18" height="18"><circle cx="11" cy="11" r="7"/><path d="m16.5 16.5 4 4"/></svg><input id="search" aria-label="Search traffic" type="search" placeholder="Callsign, registration, MMSI…" autocomplete="off" /><kbd>⌕</kbd></label>
+        <label class="option-row"><span>DATA TAGS</span><input id="toggle-tags" type="checkbox" checked /></label>
         <label class="option-row"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" width="18" height="18"><path d="M3 19c6-12 12 4 18-8M3 12c7-11 11 1 18-8"/></svg> Show movement trails</span><input id="toggle-trails" type="checkbox" checked /></label>
         <label class="option-row"><span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" width="18" height="18"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l4 2"/></svg> Auto refresh</span><input id="toggle-auto" type="checkbox" checked /></label>
         <div class="helper">Trails accumulate while this page is open. Position updates are not historical routes.</div>
@@ -59,6 +60,7 @@
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="./config.js"></script>
+  <script src="./target-model.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

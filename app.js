@@ -5,12 +5,13 @@
 (() => {
   'use strict';
   const cfg = window.ATLAS_CONFIG || {};
+  const H=window.ATLAS_TARGETS;
   const base = String(cfg.API_BASE || '').replace(/\/$/, '');
   const refreshMs = Math.max(15000, Number(cfg.AIRCRAFT_REFRESH_MS) || 20000);
   const minZoom = Math.max(4, Number(cfg.MIN_LIVE_ZOOM) || 6);
   const get = id => document.getElementById(id);
   const state = {
-    demo: !base, airOn: true, seaOn: true, trailsOn: true, auto: true,
+    demo: !base, tagsOn:true, airOn: true, seaOn: true, trailsOn: true, auto: true,
     aircraft: new Map(), vessels: new Map(), history: new Map(), markers: new Map(),
     selection: null, socket: null, reconnectTimer: null, moveTimer: null,
     renderTimer: null, demoTimer: null, fetchController: null, pollTimer: null,
@@ -18,7 +19,8 @@
     aisConnected: false, aisError: false, aisOutOfRange: false,
     flightError: false, lastFetchRegion: '', requestTimer: null,
     marineFallback: false, marinePollTimer: null, marineController: null,
-    marineRequestTimer: null, aisWatchTimer: null
+    marineRequestTimer: null, aisWatchTimer: null,
+    enrichment:new Map(), selectionRequest:null, selectionController:null
   };
   const places = {
     adelaide: [-34.93, 138.60, 8], singapore: [1.29, 103.85, 9],
@@ -40,7 +42,7 @@
   const numberText = n => Number.isFinite(n) ? n.toLocaleString('en-AU') : '—';
   const safe = val => String(val ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
   const coord = (n, pos, neg) => `${Math.abs(n).toFixed(2)}°${n >= 0 ? pos : neg}`;
-  const label = x => x.kind === 'aircraft' ? (x.callsign || x.registration || x.id) : (x.name || x.id);
+  const label=H.label;
   const infoTime = time => time ? new Date(time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '—';
   const validPoint = x => Number.isFinite(x?.lat) && Number.isFinite(x?.lon) && Math.abs(x.lat) <= 90 && Math.abs(x.lon) <= 180;
   const targetKey = x => `${x.kind}:${x.id}`;
@@ -65,41 +67,82 @@
   }
   function showCounts() {
     const search = get('search').value.trim().toLowerCase();
-    const visible = x => !search || [x.id, label(x), x.callsign, x.registration, x.type].some(s => String(s||'').toLowerCase().includes(search));
+    const visible=x=>H.matches(x,search);
     const bounds = map.getBounds();
     get('aircraft-count').textContent = state.airOn ? numberText([...state.aircraft.values()].filter(x=>bounds.contains([x.lat,x.lon])&&visible(x)).length) : 'OFF';
     get('vessel-count').textContent = state.seaOn ? numberText([...state.vessels.values()].filter(x=>bounds.contains([x.lat,x.lon])&&visible(x)).length) : 'OFF';
   }
+  let lastCard='';
+  function selectionKey(item) {return `${targetKey(item)}:${item.registration||''}`;}
+  function selectTarget(key) {
+    if(state.selectionController)state.selectionController.abort();
+    state.selectionController=null;state.selectionRequest=null;state.selection=key;
+    renderSelected();queueRender();
+  }
+  function loadSelected(item) {
+    if(state.demo || !base)return;
+    const key=selectionKey(item),cached=state.enrichment.get(key);
+    if(cached&&cached.expires>Date.now() || state.selectionRequest===key)return;
+    if(state.selectionController)state.selectionController.abort();
+    const controller=new AbortController();state.selectionController=controller;state.selectionRequest=key;
+    const timer=setTimeout(()=>controller.abort(),12000);
+    const url=item.kind==='aircraft'?`${base}/api/aircraft-photo?hex=${encodeURIComponent(item.id)}&registration=${encodeURIComponent(item.registration||'')}`:`${base}/api/vessels/${encodeURIComponent(item.id)}/details`;
+    (async()=>{
+      let value=null;
+      try {
+        const response=await fetch(url,{signal:controller.signal});
+        if(!response.ok)throw new Error('Selected metadata unavailable');
+        const body=await response.json();value=item.kind==='aircraft'?body.photo:body.vessel;
+        if(controller!==state.selectionController)return;
+        if(item.kind==='vessel'&&value?.id===item.id) {
+          const current=state.vessels.get(item.id);
+          if(current)state.vessels.set(item.id,H.mergeTarget(current,{...current,...value}));
+        }
+      } catch { /* Optional enrichment must never disrupt position rendering. */ }
+      finally {
+        clearTimeout(timer);
+        if(controller===state.selectionController){
+          state.enrichment.set(key,{value,expires:Date.now()+(value?3600000:300000)});
+          while(state.enrichment.size>200)state.enrichment.delete(state.enrichment.keys().next().value);
+          state.selectionRequest=null;state.selectionController=null;queueRender();
+        }
+      }
+    })();
+  }
   function renderSelected() {
-    const selection = state.selection;
-    const item = selection?.startsWith('aircraft:') ? state.aircraft.get(selection.slice(9))
-      : selection?.startsWith('vessel:') ? state.vessels.get(selection.slice(7)) : null;
-    if (!item) {
-      get('target-card').innerHTML = '<div class="empty-target"><div class="empty-target-icon">⌖</div><strong>No target selected</strong><span>Tap an aircraft or vessel on the map to inspect its live position.</span></div>';
-      return;
+    const selection=state.selection;
+    const item=selection?.startsWith('aircraft:')?state.aircraft.get(selection.slice(9)):selection?.startsWith('vessel:')?state.vessels.get(selection.slice(7)):null;
+    let html;
+    if(!item) html='<div class="empty-target"><div class="empty-target-icon">⌖</div><strong>No target selected</strong><span>Tap an aircraft or vessel on the map to inspect its live position.</span></div>';
+    else {
+      loadSelected(item);
+      const aircraft=item.kind==='aircraft';
+      const rows=aircraft?[
+        ['CALLSIGN',item.callsign||'—'],['REGISTRATION',item.registration||'—'],['ICAO HEX',item.id],['AIRCRAFT TYPE',item.type||'—'],
+        ['ALTITUDE',H.altitudeText(item)],['TRACK',H.trackText(item.trackDeg)],['GROUND SPEED',H.speedText(item)],['LAST POSITION',infoTime(item.updatedAt)]
+      ]:[
+        ['CALLSIGN',item.callsign||'—'],['VESSEL NAME',item.name||'—'],['VESSEL TYPE',item.typeName||'VESSEL'],['MMSI',item.id],
+        ['FLAG STATE / COUNTRY',`${item.flagEmoji||''} ${item.flagCountry||item.country||'Unknown'}`.trim()],
+        ['TRACK',H.trackText(item.trackDeg)],...(Number.isFinite(item.headingDeg)?[['HEADING',H.trackText(item.headingDeg)]]:[]),
+        ['SPEED OVER GROUND',H.speedText(item)],['LATITUDE',coord(item.lat,'N','S')],['LONGITUDE',coord(item.lon,'E','W')],['LAST POSITION',infoTime(item.updatedAt)],['PROVIDER',item.provider||item.source||'—']
+      ];
+      const photo=aircraft?state.enrichment.get(selectionKey(item))?.value:null;
+      let media='';
+      if(photo?.thumbnailUrl&&photo?.sourcePage&&photo?.photographer) media=`<figure class="target-photo" id="aircraft-photo-wrap"><a href="${safe(photo.sourcePage)}" target="_blank" rel="noopener noreferrer"><img id="target-photo" src="${safe(photo.thumbnailUrl)}" loading="lazy" alt="${safe(item.registration||item.id)} aircraft photograph"></a><figcaption>© ${safe(photo.photographer)} · <a href="${safe(photo.sourcePage)}" target="_blank" rel="noopener noreferrer">Planespotters.net</a></figcaption></figure>`;
+      else if(!aircraft)media='<div class="vessel-silhouette" role="img" aria-label="Generic vessel silhouette"><svg viewBox="0 0 180 60" aria-hidden="true"><path d="M10 36h155l-22 20H38Z M40 33V19h49v14 M65 19V8h14v11 M97 33V24h40v9 M5 59h165"/></svg></div>';
+      html=`<div class="target-title"><div><span class="label">${aircraft?'AIRCRAFT TARGET':'MARITIME TARGET'}</span><strong>${safe(label(item))}</strong></div><span class="type-pill ${aircraft?'':'vessel'}">${aircraft?'ADS-B':'AIS'}</span></div>${media}<dl class="target-grid">${rows.map(([k,v])=>`<div><dt>${safe(k)}</dt><dd>${safe(v)}</dd></div>`).join('')}</dl>${aircraft?'':'<p class="helper">Flag state identifies vessel registration, not owner, operator or crew nationality.</p>'}${!aircraft&&Array.isArray(item.attribution)?`<p class="helper">${safe(item.attribution.join(' · '))}</p>`:''}`;
     }
-    const aircraft = item.kind === 'aircraft';
-    const rows = aircraft ? [
-      ['ICAO HEX',item.id], ['REGISTRATION',item.registration || 'Unknown'],
-      ['ALTITUDE',item.altitudeFt == null ? '—' : `${numberText(item.altitudeFt)} ft`],
-      ['GROUND SPEED',item.speedKt == null ? '—' : `${numberText(item.speedKt)} kt`],
-      ['TRACK',item.heading == null ? '—' : `${Math.round(item.heading)}°`],
-      ['AIRCRAFT TYPE',item.type || 'Unknown']
-    ] : [
-      ['MMSI',item.id], ['SPEED OVER GROUND',item.speedKt == null ? '—' : `${item.speedKt.toFixed(1)} kt`],
-      ['COURSE / HEADING',item.heading == null ? '—' : `${Math.round(item.heading)}°`],
-      ['LATITUDE',coord(item.lat,'N','S')], ['LONGITUDE',coord(item.lon,'E','W')],
-      ['LAST MESSAGE',infoTime(item.updatedAt)]
-    ];
-    get('target-card').innerHTML = `<div class="target-title"><div><span class="label">${aircraft?'AIRBORNE TARGET':'MARITIME TARGET'}</span><strong>${safe(label(item))}</strong></div><span class="type-pill ${aircraft?'':'vessel'}">${aircraft?'ADS-B':'AIS'}</span></div><dl class="target-grid">${rows.map(([k,v])=>`<div><dt>${safe(k)}</dt><dd>${safe(v)}</dd></div>`).join('')}</dl>`;
+    if(html!==lastCard){get('target-card').innerHTML=html;lastCard=html;
+      const image=get('target-photo');if(image)image.onerror=()=>{const wrapper=get('aircraft-photo-wrap');if(wrapper)wrapper.hidden=true;};
+    }
   }
 
-  function symbol(x, selected) {
-    const angle = Number.isFinite(x.heading) ? x.heading : 0;
+  function symbol(x, selected, showTag=false, layout=null) {
+    const angle=H.orientation(x);
     const path = x.kind === 'aircraft'
       ? '<path d="M12 1.2c-.6 0-1.1.6-1.1 1.5v7l-8 5v2l8-2.5v5.4l-2.4 1.8V23l3.5-1.1 3.5 1.1v-1.6l-2.4-1.8v-5.4l8 2.5v-2l-8-5v-7c0-.9-.5-1.5-1.1-1.5Z"/>'
       : '<path d="M12 1 19.6 20.3 12 16.9 4.4 20.3 12 1Z"/><path d="M9 19.5 12 21l3-1.5" fill="none" stroke-width="1.5"/>';
-    return L.divIcon({ className:'marker-wrap', html:`<div class="traffic-marker ${x.kind} ${selected?'selected':''}"><svg viewBox="0 0 24 24" style="transform:rotate(${angle}deg)">${path}</svg></div>`, iconSize:[27,27],iconAnchor:[13,13] });
+    return L.divIcon({ className:'marker-wrap', html:`<div class="traffic-marker ${x.kind} ${selected?'selected':''}"><svg viewBox="0 0 24 24" style="transform:rotate(${angle}deg)">${path}</svg>${showTag?`<div class="target-tag ${layout?.alignLeft?'tag-left':''}" style="--tag-width:${layout?.width||190}px" aria-hidden="true">${H.tagLines(x).map((line,i)=>`<div class="tag-line-${i}">${safe(line)}</div>`).join('')}</div>`:''}</div>`, iconSize:[27,27],iconAnchor:[13,13] });
   }
 
   function markHistory(x) {
@@ -121,7 +164,7 @@
     const collection=x.kind==='aircraft'?state.aircraft:state.vessels;
     const previous=collection.get(x.id);
     if(previous && x.updatedAt < previous.updatedAt) return;
-    if(x.kind==='vessel' && !x.name && previous?.name) x.name=previous.name;
+    x=H.mergeTarget(previous,x);
     collection.set(x.id,x);
     markHistory(x);
     state.lastUpdate = Date.now();
@@ -134,32 +177,47 @@
   function render() {
     const bounds = map.getBounds();
     const search = get('search').value.toLowerCase().trim();
-    const filtered = x => bounds.contains([x.lat,x.lon]) && (!search ||
-      [x.id,x.callsign,x.registration,x.name,x.type].some(t => String(t||'').toLowerCase().includes(search)));
+    const filtered=x=>bounds.contains([x.lat,x.lon])&&H.matches(x,search);
     const next = new Set();
-    let trackCount = 0;
+    let trackCount = 0,tagCount=0;const tagRects=[];
+    const tagRect=x=>{
+      const point=map.latLngToContainerPoint?.([x.lat,x.lon]);if(!point)return null;
+      const mapWidth=map.getSize().x,preferred=mapWidth>750?210:185;
+      const rightSpace=mapWidth-point.x-30,leftSpace=point.x-30;
+      const alignLeft=rightSpace<preferred&&leftSpace>rightSpace;
+      const width=Math.max(110,Math.min(preferred,alignLeft?leftSpace:rightSpace));
+      const left=alignLeft?point.x-22-width:point.x+22;
+      return {left,top:point.y-22,right:left+width+4,bottom:point.y+40,alignLeft,width};
+    };
+    const selectedTarget=[...state.aircraft.values(),...state.vessels.values()].find(x=>targetKey(x)===state.selection);
+    if(selectedTarget){const rect=tagRect(selectedTarget);if(rect)tagRects.push(rect);}
     trailGroup.clearLayers();
     for (const [enabled, collection] of [[state.airOn,state.aircraft],[state.seaOn,state.vessels]]) {
       if (!enabled) continue;
       let count=0;
-      for (const x of collection.values()) {
+      for (const x of [...collection.values()].sort((a,b)=>Number(targetKey(b)===state.selection)-Number(targetKey(a)===state.selection))) {
         if (count>=1800) break;
         if (!filtered(x)) continue;
         count++;
         const key = targetKey(x);
         next.add(key);
+        const rect=tagRect(x);
+        const overlaps=rect&&tagRects.some(r=>rect.left<r.right&&rect.right>r.left&&rect.top<r.bottom&&rect.bottom>r.top);
+        const showTag=key===state.selection || (state.tagsOn && map.getZoom()>=9 && tagCount<80 && !overlaps);
+        if(showTag){tagCount++;if(rect&&key!==state.selection)tagRects.push(rect);}
         let marker = state.markers.get(key);
         if (!marker) {
-          marker = L.marker([x.lat,x.lon], {icon:symbol(x,key===state.selection),keyboard:true, title:label(x)});
-          marker.on('click',()=> { state.selection=key; renderSelected(); queueRender(); });
+          marker = L.marker([x.lat,x.lon], {icon:symbol(x,key===state.selection,showTag,rect),keyboard:true, title:label(x)});
+          marker.on('click',()=>selectTarget(key));
           marker.bindTooltip(safe(label(x)), {direction:'top', offset:[0,-11]});
           state.markers.set(key,marker);
           marker.addTo(markerGroup);
         } else {
           marker.setLatLng([x.lat,x.lon]);
-          marker.setIcon(symbol(x,key===state.selection));
+          marker.setIcon(symbol(x,key===state.selection,showTag,rect));
           marker.setTooltipContent(safe(label(x)));
         }
+        marker.setZIndexOffset?.(key===state.selection?2000:0);
         if (state.trailsOn && trackCount < 220) {
           const points = state.history.get(key);
           if (points?.length>=2) {
@@ -191,6 +249,8 @@
 
   function clearTraffic() {
     state.aircraft.clear(); state.vessels.clear(); state.history.clear();
+    if(state.selectionController)state.selectionController.abort();
+    state.selectionController=null;state.selectionRequest=null;
     state.selection=null; state.lastUpdate=0;
     state.lastFetchRegion='';
     for (const marker of state.markers.values()) markerGroup.removeLayer(marker);
@@ -224,9 +284,10 @@
       const lat=Math.max(-80,Math.min(80,centre.lat+Math.sin(angle*Math.PI/180)*radial));
       const lon=Math.max(-179,Math.min(179,centre.lng+Math.cos(angle*Math.PI/180)*radial));
       const x={ kind:p.kind,id:String(900000+i),lat,lon,heading:(angle+65)%360,
+        trackDeg:(angle+65)%360,headingDeg:p.kind==='vessel'?(angle+80)%360:null,
         speedKt:p.speed+(i%4)*(p.kind==='vessel'?1.5:10),updatedAt:Date.now() };
       if (p.kind==='aircraft') Object.assign(x,{callsign:`${p.prefix}${(200+i*13)}`,registration:`DEMO-${i+1}`,type:i%2?'B738':'A320',altitudeFt:p.alt+(i%6)*1100});
-      else x.name=`${p.prefix} ${String(i-15).padStart(2,'0')}`;
+      else Object.assign(x,{name:`${p.prefix} ${String(i-15).padStart(2,'0')}`,callsign:`VHO${i}`,typeCode:70,typeName:'Cargo',country:'Australia',flagCountry:'Australia',flagEmoji:'🇦🇺'});
       upsert(x);
     }
     setFeedStatus('aircraft',state.airOn?'Simulated aircraft':'Layer hidden',state.airOn?'warn':'');
@@ -269,8 +330,8 @@
       if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
       if (state.demo || controller!==state.fetchController) return;
       if (!Array.isArray(body.aircraft)) throw new Error('Invalid aircraft response');
-      state.aircraft.clear();
-      for (const x of body.aircraft) if (x?.kind==='aircraft') upsert(x);
+      const previousAircraft=new Map(state.aircraft);state.aircraft.clear();
+      for (const x of body.aircraft) if (x?.kind==='aircraft') upsert(H.mergeTarget(previousAircraft.get(String(x.id)),x));
       state.lastUpdate=Date.now();
       setFeedStatus('aircraft',body.stale?'Cached positions':'Latest positions',body.stale?'warn':'active');
       state.flightError=false;
@@ -441,6 +502,7 @@
   }
   get('toggle-aircraft').addEventListener('change',handleLayerChange);
   get('toggle-vessels').addEventListener('change',handleLayerChange);
+  get('toggle-tags').addEventListener('change',event=>{state.tagsOn=event.target.checked;queueRender();});
   get('toggle-trails').addEventListener('change',event=>{state.trailsOn=event.target.checked;queueRender();});
   get('toggle-auto').addEventListener('change',event=> {state.auto=event.target.checked;if(state.auto&&!state.demo)refreshAircraft(true);else if(!state.auto&&state.fetchController){state.fetchController.abort();state.fetchController=null;clearTimeout(state.requestTimer);setFeedStatus('aircraft','Auto refresh paused');}});
   get('search').addEventListener('input',queueRender);

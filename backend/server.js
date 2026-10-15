@@ -2,6 +2,8 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
+const { MetadataCache, staticVesselMetadata } = require('./vessel-metadata');
+const { createEnrichment } = require('./enrichment');
 const {
   clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel, normalizeOpenWatersVessel
 } = require('./lib');
@@ -16,6 +18,8 @@ const viewerLimit = Number(env.MAX_AIS_VIEWERS || 3);
 if (!Number.isSafeInteger(viewerLimit) || viewerLimit < 1) throw new Error('MAX_AIS_VIEWERS must be a positive integer');
 const MAX_AIS_VIEWERS = viewerLimit;
 const aircraftCache = new Map();
+const metadata = new MetadataCache();
+const enrichment = createEnrichment(fetchImpl);
 const vesselCache = new Map();
 const vesselRequests = new Map();
 let lastOpenWatersSnapshotAt = null;
@@ -42,6 +46,20 @@ app.get('/api/health', (req, res) => res.json({
   marineProvider: activeMarineProvider(), lastOpenWatersSnapshotAt, lastOpenWatersError,
   maxAisViewers: MAX_AIS_VIEWERS, aircraftProvider: 'adsb.lol', aircraftFallbackProvider: 'adsb.fi'
 }));
+
+// Selected targets only: strict identifiers prevent arbitrary URL/proxy access.
+app.get('/api/aircraft-photo', async (req,res)=>{
+  const hex=typeof req.query.hex==='string'?req.query.hex.trim().toLowerCase():'';
+  const registration=typeof req.query.registration==='string'?req.query.registration.trim().toUpperCase():'';
+  if((hex&&!/^[a-f0-9]{6}$/.test(hex)) || (registration&&!/^[A-Z0-9-]{2,24}$/.test(registration)) || (!hex&&!registration))return res.status(400).json({error:'Invalid aircraft identifier'});
+  try {return res.json({photo:await enrichment.photo(hex,registration)});}
+  catch(error){return res.status(error.status===429?429:502).json({error:'Aircraft photo unavailable'});}
+});
+app.get('/api/vessels/:mmsi/details',async(req,res)=>{
+  if(!/^\d{9}$/.test(req.params.mmsi))return res.status(400).json({error:'Invalid MMSI'});
+  try {const result=await enrichment.vessel(req.params.mmsi);return res.json({vessel:result?metadata.merge(result):null});}
+  catch(error){return res.status(error.status===429?429:502).json({error:'Vessel details unavailable'});}
+});
 
 app.get('/api/aircraft', async (req, res) => {
   const numericQuery = value => typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
@@ -72,7 +90,7 @@ app.get('/api/aircraft', async (req, res) => {
       const raw = await response.json();
       if (!Array.isArray(raw?.ac)) throw new Error('Invalid ADS-B response');
       const now = Date.now();
-      const aircraft = raw.ac.map(a => normalizeAircraft(a, now)).filter(Boolean);
+      const aircraft = raw.ac.map(a => normalizeAircraft(a, now)).filter(Boolean).map(a=>metadata.merge(a,now));
       const body = { updatedAt: now, provider: provider.name, centre: { lat, lon, radiusNm: radius }, aircraft };
       aircraftCache.set(key, { at: now, body });
       while (aircraftCache.size > 120) aircraftCache.delete(aircraftCache.keys().next().value);
@@ -123,7 +141,8 @@ app.get('/api/vessels', async (req, res) => {
         const now = Date.now();
         const unique = new Map();
         for (const feature of raw.features) {
-          const vessel = normalizeOpenWatersVessel(feature, now);
+          let vessel = normalizeOpenWatersVessel(feature, now);
+          if(vessel) vessel=metadata.merge(vessel,now);
           if (!vessel || !inBounds(vessel.lat, vessel.lon, bbox) || now - vessel.updatedAt > 20 * 60000) continue;
           if (!unique.has(vessel.id) || vessel.updatedAt >= unique.get(vessel.id).updatedAt) unique.set(vessel.id, vessel);
         }
@@ -194,7 +213,8 @@ function writeSubscription() {
     BoundingBoxes: boxes,
     FilterMessageTypes: [
       'PositionReport', 'StandardClassBPositionReport',
-      'ExtendedClassBPositionReport', 'LongRangeAisBroadcastMessage'
+      'ExtendedClassBPositionReport', 'LongRangeAisBroadcastMessage',
+      'ShipStaticData', 'StaticDataReport'
     ]
   }));
 }
@@ -232,7 +252,10 @@ function connectUpstream() {
       aisConfirmedAt = Date.now();
       notify({ type: 'status', state: 'connected' }); return;
     }
-    const vessel = normalizeVessel(evt);
+    const staticInfo=staticVesselMetadata(evt);
+    if(staticInfo) {metadata.merge(staticInfo);return;}
+    let vessel = normalizeVessel(evt);
+    if(vessel) vessel=metadata.merge(vessel);
     if (!vessel) return;
     lastAisMessageAt = vessel.updatedAt;
     for (const [client, bbox] of aisClients) {
