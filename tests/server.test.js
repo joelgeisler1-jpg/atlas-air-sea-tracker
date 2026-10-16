@@ -376,3 +376,20 @@ test('negative vessel details and photo lookups expire sooner than successful re
   assert.equal(calls,2);now+=2*3600000;
   await fetch(url+'/api/aircraft-photo?hex=7c1234');await fetch(url+'/api/vessels/503123456/details');assert.equal(calls,4);
 });
+
+test('adsb.fi missing dbFlags is safe and preserves known flags through provider fallback',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);let mode='primary';
+  const raw={hex:'7c1234',lat:-34.8,lon:138.5,flight:'RFR7123',t:'A400M'};
+  const {url}=await start(t,{logger:{warn(){}},fetchImpl:async endpoint=>{
+    const fallback=endpoint.includes('opendata.adsb.fi');
+    if(mode==='fallback'&&!fallback)return {ok:false,status:503};
+    const ac=mode==='fallback'?[raw,{...raw,hex:'7c5678'}]:[{...raw,dbFlags:mode==='cleared'?0:1}];
+    return {ok:true,json:async()=>({ac})};
+  }});
+  const route=`${url}/api/aircraft?lat=-34&lon=138`;
+  let body=await (await fetch(route)).json();assert.equal(body.provider,'adsb.lol');assert.equal(body.aircraft[0].military,true);
+  mode='fallback';now+=21000;body=await (await fetch(route)).json();
+  assert.equal(body.provider,'adsb.fi');assert.equal(body.aircraft[0].military,true);assert.equal(body.aircraft[0].dbFlags,1);
+  assert.equal(body.aircraft[1].military,false);assert.equal(body.aircraft[1].dbFlags,null);
+  mode='cleared';now+=21000;body=await (await fetch(route)).json();assert.equal(body.aircraft[0].military,false);assert.equal(body.aircraft[0].dbFlags,0);
+});

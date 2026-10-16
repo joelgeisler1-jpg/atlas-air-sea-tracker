@@ -30,8 +30,11 @@ function normalizeAircraft(raw, now = Date.now()) {
   if (finite(raw.seen_pos) && raw.seen_pos > 90) return null;
   const id = String(raw.hex || '').toUpperCase().replace(/[^A-F0-9]/g, '').slice(0, 12);
   if (!id) return null;
+  const flagsValue=(typeof raw.dbFlags==='number' || typeof raw.dbFlags==='string'&&raw.dbFlags.trim()!=='')?Number(raw.dbFlags):NaN;
+  const dbFlags=Number.isSafeInteger(flagsValue)&&flagsValue>=0&&flagsValue<=0xffffffff?flagsValue:null;
   return {
     kind: 'aircraft', id,
+    dbFlags, military:Boolean(Number(dbFlags)&1),
     lat: raw.lat, lon: raw.lon,
     callsign: String(raw.flight || '').trim().slice(0, 24),
     registration: String(raw.r || '').trim().slice(0, 24),

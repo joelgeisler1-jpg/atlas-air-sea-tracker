@@ -67,3 +67,42 @@ test('labels, case-insensitive search, missing telemetry and track-versus-headin
   assert.equal(H.orientation({kind:'aircraft',trackDeg:82,heading:180}),82);
   assert.equal(H.tagLines({kind:'aircraft',id:'HEX'})[1],'—  —');
 });
+
+test('military classification uses only the database military bit',()=>{
+  const raw={hex:'7c1234',lat:-34.8,lon:138.5,flight:'RFR7123',r:'ZZ123',t:'A400M'};
+  for(const flags of [1,3,5,'1','9']){
+    const x=normalizeAircraft({...raw,dbFlags:flags});
+    assert.equal(x.military,true);assert.equal(x.dbFlags,Number(flags));
+  }
+  for(const flags of [0,2,4,6,8,16,'2']){
+    const x=normalizeAircraft({...raw,dbFlags:flags});assert.equal(x.military,false);assert.equal(x.dbFlags,Number(flags));
+  }
+  for(const flags of [undefined,null,'','bad',{},true,Infinity,-1,1.5]){
+    const x=normalizeAircraft({...raw,dbFlags:flags});assert.equal(x.military,false);assert.equal(x.dbFlags,null);
+  }
+});
+
+test('military metadata survives missing flags but explicit non-military flags replace it',()=>{
+  const raw={hex:'7c1234',lat:-34.8,lon:138.5};const cache=new MetadataCache();
+  const flagged=normalizeAircraft({...raw,dbFlags:1});cache.merge(flagged,0);
+  const partial=normalizeAircraft(raw);
+  assert.equal(partial.military,false);assert.equal(partial.dbFlags,null);
+  const preserved=cache.merge(partial,1000);assert.equal(preserved.military,true);assert.equal(preserved.dbFlags,1);
+  const cleared=cache.merge(normalizeAircraft({...raw,dbFlags:0}),2000);
+  assert.equal(cleared.military,false);assert.equal(cleared.dbFlags,0);
+  assert.equal(cache.merge(partial,3000).military,false);
+  assert.equal(H.mergeTarget(flagged,{kind:'aircraft',id:flagged.id}).military,true);
+});
+
+test('military filter applies only to aircraft and badges do not pollute text search',()=>{
+  const army={kind:'aircraft',id:'43C123',callsign:'RFR7123',type:'A400M',military:true};
+  assert.equal(H.matchesFilter(army,'',true),true);
+  assert.equal(H.matchesFilter({...army,military:false},'',true),false);
+  assert.equal(H.matchesFilter({...army,military:undefined},'',true),false);
+  assert.equal(H.matchesFilter({kind:'vessel',id:'503123456',name:'CARGO SHIP'},'',true),true);
+  assert.equal(H.matchesFilter(army,'qfa',true),false);
+  assert.equal(H.matches(army,'MIL'),false);assert.equal(H.matches(army,'MILITARY'),false);
+  assert.equal(H.tagLines(army)[0],'MIL RFR7123');
+  assert.equal(H.tagLines({...army,military:false})[0],'RFR7123');
+  assert.equal(H.tagLines({kind:'vessel',id:'503123456',name:'SHIP',military:true})[0],'SHIP');
+});

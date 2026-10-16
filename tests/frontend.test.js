@@ -234,3 +234,25 @@ test('dense tags avoid collisions and place phone-edge labels to the left',()=>{
   const selected=app.markers.filter(m=>m.options.icon.html.includes('target-tag'));
   assert.equal(selected.length,1);assert.match(selected[0].options.icon.html,/selected/);
 });
+
+test('military aircraft have crimson styling and MIL badges; filter keeps vessels visible',async()=>{
+  const app=load({API_BASE:'http://localhost:3000'});const now=Date.now();
+  const military={kind:'aircraft',id:'43C123',lat:-34.8,lon:138.5,callsign:'RFR7123',type:'A400M',altitudeFt:21000,trackDeg:164,speedKt:318,dbFlags:1,military:true,updatedAt:now};
+  const civilian={...military,id:'7C1234',callsign:'QFA741',type:'B738',dbFlags:2,military:false};
+  app.map.zoom=9;
+  app.requests[0].resolve({ok:true,json:async()=>({aircraft:[military,civilian]})});await settle();
+  message(app.sockets[0],{type:'vessel',vessel:vessel()});app.runTimeout(220);
+  assert.equal(app.get('aircraft-count').textContent,'2');assert.equal(app.get('vessel-count').textContent,'1');
+  const marker=app.markers.find(m=>m.options.title==='RFR7123');
+  assert.match(marker.options.icon.html,/aircraft military/);assert.match(marker.options.icon.html,/mil-badge.*MIL/);
+  assert.doesNotMatch(app.markers.find(m=>m.options.title==='QFA741').options.icon.html,/mil-badge|aircraft military/);
+  assert.doesNotMatch(app.markers.find(m=>m.options.title==='TEST SHIP').options.icon.html,/mil-badge|vessel military/);
+  marker.handlers.click();assert.match(app.get('target-card').innerHTML,/CLASSIFICATION/);assert.match(app.get('target-card').innerHTML,/military-badge.*MILITARY/);
+  app.get('toggle-military').handlers.change({target:{checked:true}});app.runTimeout(220);
+  assert.equal(app.get('aircraft-count').textContent,'1');assert.equal(app.get('vessel-count').textContent,'1');
+  assert.doesNotMatch(app.markers.find(m=>m.options.title==='QFA741').options.icon.html,/mil-badge/);
+  app.get('search').value='MILITARY';app.get('search').handlers.input();app.runTimeout(220);
+  assert.equal(app.get('aircraft-count').textContent,'0');assert.equal(app.get('vessel-count').textContent,'0');
+  app.get('search').value='';app.get('toggle-military').handlers.change({target:{checked:false}});app.runTimeout(220);
+  assert.equal(app.get('aircraft-count').textContent,'2');assert.equal(app.get('vessel-count').textContent,'1');
+});

@@ -11,7 +11,7 @@
   const minZoom = Math.max(4, Number(cfg.MIN_LIVE_ZOOM) || 6);
   const get = id => document.getElementById(id);
   const state = {
-    demo: !base, tagsOn:true, airOn: true, seaOn: true, trailsOn: true, auto: true,
+    demo: !base, tagsOn:true, militaryOnly:false, airOn: true, seaOn: true, trailsOn: true, auto: true,
     aircraft: new Map(), vessels: new Map(), history: new Map(), markers: new Map(),
     selection: null, socket: null, reconnectTimer: null, moveTimer: null,
     renderTimer: null, demoTimer: null, fetchController: null, pollTimer: null,
@@ -67,7 +67,7 @@
   }
   function showCounts() {
     const search = get('search').value.trim().toLowerCase();
-    const visible=x=>H.matches(x,search);
+    const visible=x=>H.matchesFilter(x,search,state.militaryOnly);
     const bounds = map.getBounds();
     get('aircraft-count').textContent = state.airOn ? numberText([...state.aircraft.values()].filter(x=>bounds.contains([x.lat,x.lon])&&visible(x)).length) : 'OFF';
     get('vessel-count').textContent = state.seaOn ? numberText([...state.vessels.values()].filter(x=>bounds.contains([x.lat,x.lon])&&visible(x)).length) : 'OFF';
@@ -118,7 +118,7 @@
       loadSelected(item);
       const aircraft=item.kind==='aircraft';
       const rows=aircraft?[
-        ['CALLSIGN',item.callsign||'—'],['REGISTRATION',item.registration||'—'],['ICAO HEX',item.id],['AIRCRAFT TYPE',item.type||'—'],
+        ['CALLSIGN',item.callsign||'—'],['REGISTRATION',item.registration||'—'],['ICAO HEX',item.id],...(item.military===true?[['CLASSIFICATION','MILITARY']]:[]),['AIRCRAFT TYPE',item.type||'—'],
         ['ALTITUDE',H.altitudeText(item)],['TRACK',H.trackText(item.trackDeg)],['GROUND SPEED',H.speedText(item)],['LAST POSITION',infoTime(item.updatedAt)]
       ]:[
         ['CALLSIGN',item.callsign||'—'],['VESSEL NAME',item.name||'—'],['VESSEL TYPE',item.typeName||'VESSEL'],['MMSI',item.id],
@@ -130,7 +130,7 @@
       let media='';
       if(photo?.thumbnailUrl&&photo?.sourcePage&&photo?.photographer) media=`<figure class="target-photo" id="aircraft-photo-wrap"><a href="${safe(photo.sourcePage)}" target="_blank" rel="noopener noreferrer"><img id="target-photo" src="${safe(photo.thumbnailUrl)}" loading="lazy" alt="${safe(item.registration||item.id)} aircraft photograph"></a><figcaption>© ${safe(photo.photographer)} · <a href="${safe(photo.sourcePage)}" target="_blank" rel="noopener noreferrer">Planespotters.net</a></figcaption></figure>`;
       else if(!aircraft)media='<div class="vessel-silhouette" role="img" aria-label="Generic vessel silhouette"><svg viewBox="0 0 180 60" aria-hidden="true"><path d="M10 36h155l-22 20H38Z M40 33V19h49v14 M65 19V8h14v11 M97 33V24h40v9 M5 59h165"/></svg></div>';
-      html=`<div class="target-title"><div><span class="label">${aircraft?'AIRCRAFT TARGET':'MARITIME TARGET'}</span><strong>${safe(label(item))}</strong></div><span class="type-pill ${aircraft?'':'vessel'}">${aircraft?'ADS-B':'AIS'}</span></div>${media}<dl class="target-grid">${rows.map(([k,v])=>`<div><dt>${safe(k)}</dt><dd>${safe(v)}</dd></div>`).join('')}</dl>${aircraft?'':'<p class="helper">Flag state identifies vessel registration, not owner, operator or crew nationality.</p>'}${!aircraft&&Array.isArray(item.attribution)?`<p class="helper">${safe(item.attribution.join(' · '))}</p>`:''}`;
+      html=`<div class="target-title"><div><span class="label">${aircraft?'AIRCRAFT TARGET':'MARITIME TARGET'}</span><strong>${safe(label(item))}</strong></div><span class="type-pill ${aircraft?'':'vessel'}">${aircraft?'ADS-B':'AIS'}</span></div>${media}<dl class="target-grid">${rows.map(([k,v])=>`<div><dt>${safe(k)}</dt><dd>${k==='CLASSIFICATION'?`<span class="military-badge">${safe(v)}</span>`:safe(v)}</dd></div>`).join('')}</dl>${aircraft?'':'<p class="helper">Flag state identifies vessel registration, not owner, operator or crew nationality.</p>'}${!aircraft&&Array.isArray(item.attribution)?`<p class="helper">${safe(item.attribution.join(' · '))}</p>`:''}`;
     }
     if(html!==lastCard){get('target-card').innerHTML=html;lastCard=html;
       const image=get('target-photo');if(image)image.onerror=()=>{const wrapper=get('aircraft-photo-wrap');if(wrapper)wrapper.hidden=true;};
@@ -142,7 +142,7 @@
     const path = x.kind === 'aircraft'
       ? '<path d="M12 1.2c-.6 0-1.1.6-1.1 1.5v7l-8 5v2l8-2.5v5.4l-2.4 1.8V23l3.5-1.1 3.5 1.1v-1.6l-2.4-1.8v-5.4l8 2.5v-2l-8-5v-7c0-.9-.5-1.5-1.1-1.5Z"/>'
       : '<path d="M12 1 19.6 20.3 12 16.9 4.4 20.3 12 1Z"/><path d="M9 19.5 12 21l3-1.5" fill="none" stroke-width="1.5"/>';
-    return L.divIcon({ className:'marker-wrap', html:`<div class="traffic-marker ${x.kind} ${selected?'selected':''}"><svg viewBox="0 0 24 24" style="transform:rotate(${angle}deg)">${path}</svg>${showTag?`<div class="target-tag ${layout?.alignLeft?'tag-left':''}" style="--tag-width:${layout?.width||190}px" aria-hidden="true">${H.tagLines(x).map((line,i)=>`<div class="tag-line-${i}">${safe(line)}</div>`).join('')}</div>`:''}</div>`, iconSize:[27,27],iconAnchor:[13,13] });
+    return L.divIcon({ className:'marker-wrap', html:`<div class="traffic-marker ${x.kind} ${x.kind==='aircraft'&&x.military===true?'military':''} ${selected?'selected':''}"><svg viewBox="0 0 24 24" style="transform:rotate(${angle}deg)">${path}</svg>${showTag?`<div class="target-tag ${layout?.alignLeft?'tag-left':''}" style="--tag-width:${layout?.width||190}px" aria-hidden="true">${H.tagLines(x).map((line,i)=>`<div class="tag-line-${i}">${i===0&&x.kind==='aircraft'&&x.military===true?`<span class="mil-badge">MIL</span> ${safe(line.slice(4))}`:safe(line)}</div>`).join('')}</div>`:''}</div>`, iconSize:[27,27],iconAnchor:[13,13] });
   }
 
   function markHistory(x) {
@@ -177,7 +177,7 @@
   function render() {
     const bounds = map.getBounds();
     const search = get('search').value.toLowerCase().trim();
-    const filtered=x=>bounds.contains([x.lat,x.lon])&&H.matches(x,search);
+    const filtered=x=>bounds.contains([x.lat,x.lon])&&H.matchesFilter(x,search,state.militaryOnly);
     const next = new Set();
     let trackCount = 0,tagCount=0;const tagRects=[];
     const tagRect=x=>{
@@ -502,6 +502,7 @@
   }
   get('toggle-aircraft').addEventListener('change',handleLayerChange);
   get('toggle-vessels').addEventListener('change',handleLayerChange);
+  get('toggle-military').addEventListener('change',event=>{state.militaryOnly=event.target.checked;queueRender();});
   get('toggle-tags').addEventListener('change',event=>{state.tagsOn=event.target.checked;queueRender();});
   get('toggle-trails').addEventListener('change',event=>{state.trailsOn=event.target.checked;queueRender();});
   get('toggle-auto').addEventListener('change',event=> {state.auto=event.target.checked;if(state.auto&&!state.demo)refreshAircraft(true);else if(!state.auto&&state.fetchController){state.fetchController.abort();state.fetchController=null;clearTimeout(state.requestTimer);setFeedStatus('aircraft','Auto refresh paused');}});
