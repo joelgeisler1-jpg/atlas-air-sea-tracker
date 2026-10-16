@@ -149,7 +149,7 @@ test('both-provider failure preserves stale cache window and expiry', async t =>
   assert.equal((await fetch(route)).status, 502);
 });
 
-async function aisFixture(t) {
+async function aisFixture(t, area={bbox:[-35,138,-34,139]}) {
   const provider = new WebSocket.Server({ port: 0, host: '127.0.0.1', perMessageDeflate: true });
   await once(provider, 'listening');
   t.after(async () => {
@@ -169,7 +169,7 @@ async function aisFixture(t) {
   const messages = [];
   client.on('message', data => messages.push(JSON.parse(data.toString())));
   await once(client, 'open'); t.after(() => client.terminate());
-  client.send(JSON.stringify({ action: 'subscribe', bbox: [-35,138,-34,139] }));
+  client.send(JSON.stringify({action:'subscribe',...area}));
   const [upstream] = await connection;
   const [subscription] = await once(upstream, 'message');
   const health = async () => (await fetch(`${url}/api/health`)).json();
@@ -392,4 +392,18 @@ test('adsb.fi missing dbFlags is safe and preserves known flags through provider
   assert.equal(body.provider,'adsb.fi');assert.equal(body.aircraft[0].military,true);assert.equal(body.aircraft[0].dbFlags,1);
   assert.equal(body.aircraft[1].military,false);assert.equal(body.aircraft[1].dbFlags,null);
   mode='cleared';now+=21000;body=await (await fetch(route)).json();assert.equal(body.aircraft[0].military,false);assert.equal(body.aircraft[0].dbFlags,0);
+});
+
+test('one AIS socket forwards both date-line boxes and routes vessel reports from either side', {timeout:5000},async t=>{
+  const boxes=[[-35,179,-34,180],[-35,-180,-34,-179]];
+  const {upstream,subscription,client}=await aisFixture(t,{bboxes:boxes});
+  assert.deepEqual(subscription.BoundingBoxes,[[[-34,179],[-35,180]],[[-34,-180],[-35,-179]]]);
+  for(const [id,lon] of [[503123456,179.9],[503123457,-179.9]]){
+    const received=nextMessage(client,message=>message.type==='vessel');
+    upstream.send(JSON.stringify({MessageType:'PositionReport',MetaData:{MMSI:id,Latitude:-34.5,Longitude:lon},Message:{PositionReport:{Sog:8,Cog:90,TrueHeading:90}}}));
+    const {vessel}=await received;assert.equal(vessel.id,String(id));assert.equal(vessel.lon,lon);
+  }
+  const rejected=nextMessage(client,message=>message.type==='error');
+  client.send(JSON.stringify({action:'subscribe',bboxes:[[-35,170,-34,180],[-35,-180,-34,-170]]}));
+  assert.match((await rejected).message,/Zoom in/);
 });

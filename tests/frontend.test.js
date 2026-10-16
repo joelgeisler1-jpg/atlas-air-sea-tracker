@@ -18,27 +18,28 @@ function load(config = {}) {
     return elements.get(id);
   };
   const bounds = { contains: () => true, getSouth: () => -35, getWest: () => 138, getNorth: () => -34, getEast: () => 139 };
-  const map = { setView() { return this; }, getCenter: () => ({ lat: -34.93, lng: 138.6 }), zoom: 8, handlers: {}, getZoom() { return this.zoom; }, getBounds: () => bounds, on(event, fn) { this.handlers[event]=fn; }, hasLayer: () => false, removeLayer() {} };
-  const layer = () => ({ addTo() { return this; }, clearLayers() {}, removeLayer() {}, setLatLng() { return this; } });
+  const map = { setView(coords,zoom) { this.lastView={coords,zoom};return this; }, panTo(coords) {this.getCenter=()=>({lat:coords[0],lng:coords[1]});return this;}, getCenter: () => ({ lat: -34.93, lng: 138.6 }), zoom: 8, handlers: {}, getZoom() { return this.zoom; }, getBounds: () => bounds, on(event, fn) { this.handlers[event]=fn; }, hasLayer: () => false, removeLayer() {} };
+  const layer = () => ({ addTo() { return this; }, clearLayers() {}, removeLayer() {}, setLatLng(point) {this.position=point;return this;} });
+  const navButtons=['adelaide','singapore','rotterdam','newyork'].map(place=>({dataset:{place},handlers:{},addEventListener(event,fn){this.handlers[event]=fn;}}));
   const markers = [];
   const trails = [];
   const L = { map: () => map, tileLayer: layer, control: { zoom: layer }, layerGroup: layer, circle: layer, polyline: points => {trails.push(points);return layer();}, divIcon: x => x, marker: (_point, options) => {
-    const marker = { ...layer(), options, handlers: {}, on(event, fn) { this.handlers[event] = fn; }, bindTooltip() {}, setIcon(icon) {this.options.icon=icon;}, setTooltipContent() {} }; markers.push(marker); return marker;
+    const marker = { ...layer(), position:_point, options, handlers: {}, on(event, fn) { this.handlers[event] = fn; }, bindTooltip() {}, setIcon(icon) {this.options.icon=icon;}, setTooltipContent() {} }; markers.push(marker); return marker;
   } };
   class Socket {
     static OPEN = 1; static CONNECTING = 0;
     constructor() { this.readyState = 0; sockets.push(this); }
     close() { this.readyState = 3; this.onclose?.(); }
-    send() {}
+    send(data) {this.lastSent=JSON.parse(data);}
   }
-  const context = { window: { ATLAS_CONFIG: config }, document: { getElementById: get, querySelectorAll: () => [] }, L, WebSocket: Socket, AbortController, Date, console,
+  const context = { window: { ATLAS_CONFIG: config }, document: { getElementById: get, querySelectorAll: () => navButtons }, L, WebSocket: Socket, AbortController, Date, console,
     setTimeout(fn, delay) { const id = ++timerId; fn.delay=delay; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); },
     setInterval(fn, delay) { fn.delay=delay;intervals.push(fn);return intervals.length; }, clearInterval(id) { if(id) intervals[id-1]=null; },
     fetch(url, options) { return new Promise((resolve, reject) => requests.push({ url, resolve, reject, options })); }
   };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../target-model.js'), 'utf8'), context);
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../app.js'), 'utf8'), context);
-  return { get, sockets, requests, markers, trails, intervals, map, bounds,
+  return { navButtons,get, sockets, requests, markers, trails, intervals, map, bounds,
     runTimeout(delay) {for(const [id,fn] of [...timers]) if(fn.delay===delay){timers.delete(id);fn();}},
     runInterval(delay) {for(const fn of [...intervals]) if(fn?.delay===delay) fn();},
     flush() { const pending = [...timers]; timers.clear(); for (const [,fn] of pending) fn(); } };
@@ -255,4 +256,51 @@ test('military aircraft have crimson styling and MIL badges; filter keeps vessel
   assert.equal(app.get('aircraft-count').textContent,'0');assert.equal(app.get('vessel-count').textContent,'0');
   app.get('search').value='';app.get('toggle-military').handlers.change({target:{checked:false}});app.runTimeout(220);
   assert.equal(app.get('aircraft-count').textContent,'2');assert.equal(app.get('vessel-count').textContent,'1');
+});
+
+test('repeated-world ADS-B requests and coordinate readouts use wrapped longitude',()=>{
+  const app=load({API_BASE:'http://localhost:3000'});
+  for(const [lon,expected,readout] of [[190,-170,'170.00°W'],[370,10,'10.00°E'],[-190,170,'170.00°E'],[179.99999,-180,'180.00°E']]){
+    app.map.getCenter=()=>({lat:0,lng:lon});app.map.handlers.move();app.get('refresh-button').handlers.click();app.runTimeout(220);
+    const route=app.requests.filter(r=>r.url.includes('/api/aircraft?')).at(-1);
+    assert.equal(Number(new URL(route.url).searchParams.get('lon')),expected);
+    assert.ok(app.get('coordinates').textContent.includes(readout));
+  }
+});
+
+test('date-line AIS subscription uses two boxes on one socket and snapshots deduplicate MMSI',async()=>{
+  const app=load({API_BASE:'http://localhost:3000'});app.map.getCenter=()=>({lat:-34.5,lng:180});
+  app.bounds.getWest=()=>179;app.bounds.getEast=()=>181;
+  const socket=app.sockets[0];socket.readyState=1;socket.onopen();
+  assert.deepEqual(socket.lastSent,{action:'subscribe',bboxes:[[-35,179,-34,180],[-35,-180,-34,-179]]});
+  message(socket,{type:'status',state:'reconnecting'});
+  const requests=marineRequests(app);assert.equal(requests.length,2);assert.equal(app.sockets.length,1);
+  assert.equal(new URL(requests[0].url).searchParams.get('bbox'),'-35,179,-34,180');
+  assert.equal(new URL(requests[1].url).searchParams.get('bbox'),'-35,-180,-34,-179');
+  const time=Date.now();await snapshot(requests[0],[{...vessel(),lon:179.9,updatedAt:time}]);
+  await snapshot(requests[1],[{...vessel(),lon:-179.9,updatedAt:time+1000}]);app.runTimeout(220);
+  assert.equal(app.get('vessel-count').textContent,'1');
+  const marker=app.markers.find(m=>m.options.title==='TEST SHIP');assert.ok(Math.abs(marker.position[1]-180.1)<1e-8);
+  marker.handlers.click();assert.match(app.get('target-card').innerHTML,/179.90°W/);
+});
+
+test('aircraft markers, tags, selection and trails follow the visible world without duplicates',async()=>{
+  const app=load({API_BASE:'http://localhost:3000'});app.map.getCenter=()=>({lat:0,lng:540});app.map.zoom=9;
+  app.bounds.contains=point=>point[1]>=539&&point[1]<=541;
+  const raw={kind:'aircraft',id:'43C123',callsign:'RFR7123',lat:0,lon:179.9,military:true,dbFlags:1,updatedAt:Date.now()};
+  app.requests[0].resolve({ok:true,json:async()=>({aircraft:[raw]})});await settle();app.runTimeout(220);
+  const marker=app.markers.find(m=>m.options.title==='RFR7123');assert.ok(marker);assert.ok(Math.abs(marker.position[1]-539.9)<1e-8);
+  marker.handlers.click();assert.match(app.get('target-card').innerHTML,/CLASSIFICATION/);
+  app.get('refresh-button').handlers.click();const request=app.requests.filter(r=>r.url.includes('/api/aircraft?')).at(-1);
+  request.resolve({ok:true,json:async()=>({aircraft:[{...raw,lon:-179.9,updatedAt:raw.updatedAt+1000}]})});await settle();app.runTimeout(220);
+  assert.equal(app.get('aircraft-count').textContent,'1');assert.equal(app.markers.filter(m=>m.options.title==='RFR7123').length,1);
+  assert.ok(Math.abs(marker.position[1]-540.1)<1e-8);assert.match(marker.options.icon.html,/target-tag/);
+  assert.ok(app.trails.some(points=>points.length===2&&Math.abs(points[1][1]-points[0][1])<0.21));
+});
+
+test('latitude stays bounded while quick navigation retains canonical coordinates',()=>{
+  const app=load();app.map.getCenter=()=>({lat:89,lng:542});app.map.handlers.moveend();
+  assert.equal(app.map.getCenter().lat,84);assert.equal(app.map.getCenter().lng,542);
+  const expected={adelaide:[-34.93,138.60,8],singapore:[1.29,103.85,9],rotterdam:[51.92,4.48,9],newyork:[40.70,-74,9]};
+  for(const button of app.navButtons){button.handlers.click();const coords=expected[button.dataset.place];assert.equal(app.map.lastView.coords[1],coords[1]);assert.equal(app.map.lastView.zoom,coords[2]);}
 });

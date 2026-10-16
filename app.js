@@ -27,12 +27,12 @@
     rotterdam: [51.92, 4.48, 9], newyork: [40.70, -74.00, 9]
   };
   const map = L.map('map', {
-    preferCanvas: true, zoomControl: false, worldCopyJump: false,
-    minZoom: 2, maxZoom: 15, maxBounds: [[-84,-180],[84,180]], maxBoundsViscosity: .85
+    preferCanvas: true, zoomControl: false, worldCopyJump: true,
+    minZoom: 2, maxZoom: 15
   }).setView([-34.93, 138.60], 8);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-    maxZoom: 19, noWrap: true, className: 'atlas-map-tile'
+    maxZoom: 19, className: 'atlas-map-tile'
   }).addTo(map);
   L.control.zoom({ position:'topleft' }).addTo(map);
   const markerGroup = L.layerGroup().addTo(map);
@@ -46,6 +46,8 @@
   const infoTime = time => time ? new Date(time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '—';
   const validPoint = x => Number.isFinite(x?.lat) && Number.isFinite(x?.lon) && Math.abs(x.lat) <= 90 && Math.abs(x.lon) <= 180;
   const targetKey = x => `${x.kind}:${x.id}`;
+  const displayPoint=x=>[x.lat,H.longitudeNear(x.lon,map.getCenter().lng)];
+  const inViewport=(bounds,x)=>bounds.contains(displayPoint(x));
 
   let toastTimer;
   function toast(message) {
@@ -69,8 +71,8 @@
     const search = get('search').value.trim().toLowerCase();
     const visible=x=>H.matchesFilter(x,search,state.militaryOnly);
     const bounds = map.getBounds();
-    get('aircraft-count').textContent = state.airOn ? numberText([...state.aircraft.values()].filter(x=>bounds.contains([x.lat,x.lon])&&visible(x)).length) : 'OFF';
-    get('vessel-count').textContent = state.seaOn ? numberText([...state.vessels.values()].filter(x=>bounds.contains([x.lat,x.lon])&&visible(x)).length) : 'OFF';
+    get('aircraft-count').textContent = state.airOn ? numberText([...state.aircraft.values()].filter(x=>inViewport(bounds,x)&&visible(x)).length) : 'OFF';
+    get('vessel-count').textContent = state.seaOn ? numberText([...state.vessels.values()].filter(x=>inViewport(bounds,x)&&visible(x)).length) : 'OFF';
   }
   let lastCard='';
   function selectionKey(item) {return `${targetKey(item)}:${item.registration||''}`;}
@@ -150,8 +152,8 @@
     let track = state.history.get(key);
     if (!track) { track=[]; state.history.set(key,track); }
     const previous = track.at(-1);
-    const moved = !previous || Math.abs(previous[0]-x.lat) + Math.abs(previous[1]-x.lon) > 0.0002;
-    const plausible = !previous || Math.abs(previous[0]-x.lat) < 5 && Math.abs(previous[1]-x.lon) < 5;
+    const moved = !previous || Math.abs(previous[0]-x.lat) + Math.abs(H.wrapLongitude(previous[1]-x.lon)) > 0.0002;
+    const plausible = !previous || Math.abs(previous[0]-x.lat) < 5 && Math.abs(H.wrapLongitude(previous[1]-x.lon)) < 5;
     if (!plausible) track=[];
     if (moved) track.push([x.lat,x.lon, x.updatedAt]);
     if (track.length > 55) track.splice(0, track.length-55);
@@ -177,11 +179,11 @@
   function render() {
     const bounds = map.getBounds();
     const search = get('search').value.toLowerCase().trim();
-    const filtered=x=>bounds.contains([x.lat,x.lon])&&H.matchesFilter(x,search,state.militaryOnly);
+    const filtered=x=>inViewport(bounds,x)&&H.matchesFilter(x,search,state.militaryOnly);
     const next = new Set();
     let trackCount = 0,tagCount=0;const tagRects=[];
     const tagRect=x=>{
-      const point=map.latLngToContainerPoint?.([x.lat,x.lon]);if(!point)return null;
+      const point=map.latLngToContainerPoint?.(displayPoint(x));if(!point)return null;
       const mapWidth=map.getSize().x,preferred=mapWidth>750?210:185;
       const rightSpace=mapWidth-point.x-30,leftSpace=point.x-30;
       const alignLeft=rightSpace<preferred&&leftSpace>rightSpace;
@@ -207,13 +209,13 @@
         if(showTag){tagCount++;if(rect&&key!==state.selection)tagRects.push(rect);}
         let marker = state.markers.get(key);
         if (!marker) {
-          marker = L.marker([x.lat,x.lon], {icon:symbol(x,key===state.selection,showTag,rect),keyboard:true, title:label(x)});
+          marker = L.marker(displayPoint(x), {icon:symbol(x,key===state.selection,showTag,rect),keyboard:true, title:label(x)});
           marker.on('click',()=>selectTarget(key));
           marker.bindTooltip(safe(label(x)), {direction:'top', offset:[0,-11]});
           state.markers.set(key,marker);
           marker.addTo(markerGroup);
         } else {
-          marker.setLatLng([x.lat,x.lon]);
+          marker.setLatLng(displayPoint(x));
           marker.setIcon(symbol(x,key===state.selection,showTag,rect));
           marker.setTooltipContent(safe(label(x)));
         }
@@ -221,7 +223,7 @@
         if (state.trailsOn && trackCount < 220) {
           const points = state.history.get(key);
           if (points?.length>=2) {
-            L.polyline(points.map(p=>[p[0],p[1]]), {
+            L.polyline(H.unwrapTrail(points,displayPoint(x)[1]), {
               color:x.kind==='aircraft'?'#efab57':'#53d7e6', weight:key===state.selection?3:1.7,
               opacity:key===state.selection ? .9 : .38, dashArray:x.kind==='aircraft'?'5 5':null,
               interactive:false, smoothFactor:2
@@ -234,7 +236,7 @@
     for (const [k,marker] of state.markers) if (!next.has(k)) { markerGroup.removeLayer(marker); state.markers.delete(k); }
     showCounts(); renderSelected(); updateHeader();
     const center = map.getCenter();
-    get('coordinates').textContent = `${coord(center.lat,'N','S')} · ${coord(center.lng,'E','W')}`;
+    get('coordinates').textContent = `${coord(center.lat,'N','S')} · ${coord(H.wrapLongitude(center.lng),'E','W')}`;
     if (!state.demo && state.airOn && map.getZoom() >= minZoom) {
       coverageRing.setLatLng(center);
       if (!map.hasLayer(coverageRing)) coverageRing.addTo(map);
@@ -282,7 +284,7 @@
       const spread=i<16?.12:.24;
       const radial=spread*(.28+(i%9)/9);
       const lat=Math.max(-80,Math.min(80,centre.lat+Math.sin(angle*Math.PI/180)*radial));
-      const lon=Math.max(-179,Math.min(179,centre.lng+Math.cos(angle*Math.PI/180)*radial));
+      const lon=H.wrapLongitude(centre.lng+Math.cos(angle*Math.PI/180)*radial);
       const x={ kind:p.kind,id:String(900000+i),lat,lon,heading:(angle+65)%360,
         trackDeg:(angle+65)%360,headingDeg:p.kind==='vessel'?(angle+80)%360:null,
         speedKt:p.speed+(i%4)*(p.kind==='vessel'?1.5:10),updatedAt:Date.now() };
@@ -302,7 +304,7 @@
       const theta=(x.heading||0)*Math.PI/180;
       const dy=(distanceNm/60)*Math.cos(theta);
       const dx=(distanceNm/60)*Math.sin(theta)/Math.max(.2,Math.cos(x.lat*Math.PI/180));
-      x.lat+=dy;x.lon+=dx;x.updatedAt=Date.now();
+      x.lat+=dy;x.lon=H.wrapLongitude(x.lon+dx);x.updatedAt=Date.now();
       if (validPoint(x)) upsert(x);
     }
   }
@@ -314,7 +316,8 @@
   async function refreshAircraft(force=false) {
     if (state.demo || !state.airOn || !state.auto && !force || map.getZoom()<minZoom) return;
     const center=map.getCenter();
-    const region=`${center.lat.toFixed(2)},${center.lng.toFixed(2)}`;
+    const requestLon=H.wrapLongitude(Number(H.wrapLongitude(center.lng).toFixed(4)));
+    const region=`${center.lat.toFixed(2)},${requestLon.toFixed(2)}`;
     if (!force && region===state.lastFetchRegion && Date.now()-state.flightRegion<refreshMs-2000) return;
     state.lastFetchRegion=region;
     state.flightRegion=Date.now();
@@ -325,7 +328,7 @@
     state.requestTimer=setTimeout(()=>{timedOut=true;controller.abort();},20000);
     setFeedStatus('aircraft','Fetching positions…','warn');
     try {
-      const response=await fetch(`${base}/api/aircraft?lat=${center.lat.toFixed(4)}&lon=${center.lng.toFixed(4)}&radius=250`, {signal:controller.signal,cache:'no-store'});
+      const response=await fetch(`${base}/api/aircraft?lat=${center.lat.toFixed(4)}&lon=${requestLon.toFixed(4)}&radius=250`, {signal:controller.signal,cache:'no-store'});
       const body=await response.json();
       if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
       if (state.demo || controller!==state.fetchController) return;
@@ -354,11 +357,9 @@
     const b=map.getBounds();
     return [b.getSouth(),b.getWest(),b.getNorth(),b.getEast()].map(n=>Number(n.toFixed(5)));
   }
-  function bboxAllowed(b) {
-    return b[0]>=-90 && b[2]<=90 && b[1]>=-180 && b[3]<=180 &&
-      b[0]<b[2] && b[1]<b[3] && b[2]-b[0]<=8 && b[3]-b[1]<=12;
-  }
-  const marineAllowed = () => !state.demo && state.seaOn && map.getZoom()>=minZoom && bboxAllowed(currentBbox());
+  const currentBboxes=()=>H.splitViewport(currentBbox());
+  const subscription=()=>{const boxes=currentBboxes();return boxes?.length===1?{action:'subscribe',bbox:boxes[0]}:{action:'subscribe',bboxes:boxes};};
+  const marineAllowed = () => !state.demo && state.seaOn && map.getZoom()>=minZoom && currentBboxes()!==null;
   function stopFallback() {
     state.marineFallback=false;
     clearInterval(state.marinePollTimer);state.marinePollTimer=null;
@@ -385,14 +386,26 @@
     const controller=new AbortController();state.marineController=controller;
     clearTimeout(state.marineRequestTimer);
     state.marineRequestTimer=setTimeout(()=>controller.abort(),12000);
-    const bbox=currentBbox();
+    const boxes=currentBboxes(),region=JSON.stringify(boxes);
     try {
-      const response=await fetch(`${base}/api/vessels?bbox=${encodeURIComponent(bbox.join(','))}`, {signal:controller.signal,cache:'no-store'});
-      const body=await response.json();
-      if(!response.ok || !Array.isArray(body?.vessels)) throw new Error('Marine feed unavailable');
-      if(controller!==state.marineController || !state.marineFallback || !marineAllowed() || bbox.join(',')!==currentBbox().join(',')) return;
-      for(const vessel of body.vessels) if(vessel?.kind==='vessel') upsert(vessel);
-      if(get('marine-attribution')) get('marine-attribution').textContent=(Array.isArray(body.attribution)?body.attribution:[]).filter(value=>typeof value==='string').join(' · ');
+      const bodies=await Promise.all(boxes.map(async bbox=>{
+        const response=await fetch(`${base}/api/vessels?bbox=${encodeURIComponent(bbox.join(','))}`, {signal:controller.signal,cache:'no-store'});
+        const body=await response.json();
+        if(!response.ok || !Array.isArray(body?.vessels))throw new Error('Marine feed unavailable');
+        return body;
+      }));
+      if(controller!==state.marineController || !state.marineFallback || !marineAllowed() || region!==JSON.stringify(currentBboxes()))return;
+      const unique=new Map(),credits=new Set();
+      for(const body of bodies){
+        for(const vessel of body.vessels)if(vessel?.kind==='vessel'){
+          const id=String(vessel.id),previous=unique.get(id);
+          if(!previous)unique.set(id,vessel);
+          else {const newer=vessel.updatedAt>=previous.updatedAt;unique.set(id,H.mergeTarget(newer?previous:vessel,newer?vessel:previous));}
+        }
+        for(const credit of Array.isArray(body.attribution)?body.attribution:[])if(typeof credit==='string')credits.add(credit);
+      }
+      for(const vessel of unique.values())upsert(vessel);
+      if(get('marine-attribution'))get('marine-attribution').textContent=[...credits].join(' · ');
       state.lastUpdate=Date.now();
       setFeedStatus('vessels','Open Waters live','active');queueRender();
     } catch {
@@ -412,13 +425,12 @@
   }
   function openAis() {
     if(state.demo || !state.seaOn) return;
-    state.aisOutOfRange=!bboxAllowed(currentBbox());
+    state.aisOutOfRange=currentBboxes()===null;
     if(!marineAllowed()) {
       stopMarine();setFeedStatus('vessels','Zoom in for marine traffic','warn');queueRender();return;
     }
-    const bbox=currentBbox();
     if(state.socket?.readyState===WebSocket.OPEN) {
-      state.socket.send(JSON.stringify({action:'subscribe',bbox}));return;
+      state.socket.send(JSON.stringify(subscription()));return;
     }
     if(state.socket?.readyState===WebSocket.CONNECTING) return;
     clearTimeout(state.reconnectTimer);
@@ -431,7 +443,7 @@
     try { socket=new WebSocket(wsURL); } catch { startFallback();return; }
     state.socket=socket;
     socket.onopen=()=> {
-      if(socket===state.socket && marineAllowed()) socket.send(JSON.stringify({action:'subscribe',bbox:currentBbox()}));
+      if(socket===state.socket && marineAllowed()) socket.send(JSON.stringify(subscription()));
     };
     socket.onmessage=event=>{
       if(socket!==state.socket || !marineAllowed()) return;
@@ -477,11 +489,16 @@
     if(state.airOn) refreshAircraft(true);
     if(state.seaOn) {openAis();if(state.marineFallback) refreshVessels(true);}
     const bounds=map.getBounds();
-    for(const [id,x] of state.vessels) if(!bounds.contains([x.lat,x.lon])) state.vessels.delete(id);
+    for(const [id,x] of state.vessels) if(!inViewport(bounds,x)) state.vessels.delete(id);
     queueRender();
   }
   function planViewport() { clearTimeout(state.moveTimer);state.moveTimer=setTimeout(updateViewport,900); }
-  map.on('moveend', planViewport);
+  map.on('moveend',()=>{
+    const center=map.getCenter(),lat=Math.max(-84,Math.min(84,center.lat));
+    if(lat!==center.lat)map.panTo([lat,center.lng],{animate:false});
+    planViewport();
+  });
+  map.on('move',queueRender);
   map.on('mousemove',()=>{});
 
   function handleLayerChange() {

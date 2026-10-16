@@ -20,6 +20,16 @@ function validateBoundingBox(input) {
   return [south, west, north, east];
 }
 
+function validateBoundingBoxes(input) {
+  if(!Array.isArray(input)||input.length<1||input.length>2)return null;
+  const boxes=input.map(validateBoundingBox);if(boxes.some(box=>!box))return null;
+  if(boxes.length===1)return boxes;
+  const east=boxes.find(box=>box[3]===180),west=boxes.find(box=>box[1]===-180);
+  if(!east||!west||east===west||east[0]!==west[0]||east[2]!==west[2])return null;
+  if((180-east[1])+(west[3]+180)>12+1e-9)return null;
+  return [east,west];
+}
+
 function inBounds(lat, lon, bbox) {
   const [south, west, north, east] = bbox;
   return lat >= south && lat <= north && lon >= west && lon <= east;
@@ -103,4 +113,4 @@ function normalizeOpenWatersVessel(feature, now = Date.now()) {
   };
 }
 
-module.exports = { clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel, normalizeOpenWatersVessel };
+module.exports = { clamp, validLatLon, validateBoundingBox, validateBoundingBoxes, inBounds, normalizeAircraft, normalizeVessel, normalizeOpenWatersVessel };

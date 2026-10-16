@@ -5,7 +5,7 @@ const WebSocket = require('ws');
 const { MetadataCache, staticVesselMetadata } = require('./vessel-metadata');
 const { createEnrichment } = require('./enrichment');
 const {
-  clamp, validLatLon, validateBoundingBox, inBounds, normalizeAircraft, normalizeVessel, normalizeOpenWatersVessel
+  clamp, validLatLon, validateBoundingBox, validateBoundingBoxes, inBounds, normalizeAircraft, normalizeVessel, normalizeOpenWatersVessel
 } = require('./lib');
 
 function createServer({ env = process.env, fetchImpl = globalThis.fetch, upstreamURL = 'wss://stream.aisstream.io/v0/stream', logger = console } = {}) {
@@ -167,7 +167,7 @@ app.get('/api/vessels', async (req, res) => {
 });
 
 const wsServer = new WebSocket.Server({ noServer: true, maxPayload: 2048 });
-const aisClients = new Map(); // browser socket → [south, west, north, east]
+const aisClients = new Map(); // browser socket → one local box or a validated date-line pair
 let upstream = null;
 let reconnectTimer = null;
 let updateTimer = null;
@@ -193,9 +193,7 @@ function send(ws, msg) {
 }
 function notify(msg) { for (const client of aisClients.keys()) send(client, msg); }
 function currentBoxes() {
-  return [...aisClients.values()].map(([south, west, north, east]) => [
-    [north, west], [south, east]
-  ]);
+  return [...aisClients.values()].flatMap(boxes=>boxes.map(([south,west,north,east])=>[[north,west],[south,east]]));
 }
 function stopUpstream() {
   clearTimeout(reconnectTimer); clearTimeout(updateTimer);
@@ -258,8 +256,8 @@ function connectUpstream() {
     if(vessel) vessel=metadata.merge(vessel);
     if (!vessel) return;
     lastAisMessageAt = vessel.updatedAt;
-    for (const [client, bbox] of aisClients) {
-      if (inBounds(vessel.lat, vessel.lon, bbox)) send(client, { type: 'vessel', vessel });
+    for (const [client, boxes] of aisClients) {
+      if (boxes.some(bbox=>inBounds(vessel.lat, vessel.lon, bbox))) send(client, { type: 'vessel', vessel });
     }
   });
   socket.on('error', error => {
@@ -301,11 +299,11 @@ wsServer.on('connection', client => {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
     if (!msg || typeof msg !== 'object' || msg.action !== 'subscribe') return;
-    const bbox = validateBoundingBox(msg.bbox);
-    if (!bbox) { send(client, { type: 'error', message: 'Zoom in further: AIS area must be ≤8° latitude × 12° longitude.' }); return; }
+    const boxes = validateBoundingBoxes(msg.bboxes===undefined?[msg.bbox]:msg.bboxes);
+    if (!boxes) { send(client, { type: 'error', message: 'Zoom in further: AIS area must be ≤8° latitude × 12° longitude.' }); return; }
     subscribed = true;
     clearTimeout(timeout);
-    aisClients.set(client, bbox);
+    aisClients.set(client, boxes);
     if (!AIS_KEY) { send(client, { type: 'status', state: 'unconfigured' }); return; }
     if (!upstream) connectUpstream();
     else if (upstream.readyState === WebSocket.OPEN) {
